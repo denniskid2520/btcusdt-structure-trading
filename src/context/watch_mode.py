@@ -19,7 +19,7 @@ from pathlib import Path
 from context.live_setup_validator import save_report, validate_case10_live_setup
 
 
-DEFAULT_REPORT_PATH = "data/reports/current_live_setup_report.json"
+DEFAULT_REPORT_PATH = "data/reports/current_live_setup_report.json"  # shared with Codex reports
 
 
 def _print_status(report: dict) -> None:

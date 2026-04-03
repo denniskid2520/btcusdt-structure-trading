@@ -7,7 +7,7 @@ from adapters.base import OrderRequest, Position
 
 @dataclass(frozen=True)
 class RiskLimits:
-    max_position_pct: float = 0.25
+    max_position_pct: float = 0.90
     risk_per_trade_pct: float = 0.02
     max_open_positions: int = 1
 

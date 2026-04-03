@@ -61,6 +61,19 @@ def test_parent_timeline_includes_a_to_g() -> None:
     assert [item.structure_id for item in timeline] == ["A", "B", "C", "D", "E", "F", "G"]
 
 
+def test_parent_b_key_low_dates_match_real_data() -> None:
+    """Parent B key_low on 2025-03-11 should be 2025-03-10 (matches 4H close)."""
+    timeline = build_parent_structure_timeline()
+    parent_b = next(p for p in timeline if p.structure_id == "B")
+    key_low_dates = [kl["date"] for kl in parent_b.key_lows]
+    assert "2025-03-10" in key_low_dates, (
+        f"Parent B key_low should use 2025-03-10 (4H close=78595.9), got dates: {key_low_dates}"
+    )
+    assert "2025-03-11" not in key_low_dates, (
+        "2025-03-11 daily low was 76606, not 78595 — date should be 2025-03-10"
+    )
+
+
 def test_report_payload_and_markdown_have_required_sections() -> None:
     payload = build_report_payload()
     assert "parent_structure_timeline" in payload

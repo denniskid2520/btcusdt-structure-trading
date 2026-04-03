@@ -66,7 +66,7 @@ def build_parent_structure_timeline() -> list[ParentStructure]:
             ],
             key_lows=[
                 {"date": "2025-02-28", "price": 78258.0},
-                {"date": "2025-03-11", "price": 78595.0},
+                {"date": "2025-03-10", "price": 78595.0},
                 {"date": "2025-04-08", "price": 76239.0},
             ],
             transition_event=(
@@ -135,6 +135,7 @@ def build_parent_structure_timeline() -> list[ParentStructure]:
             key_lows=[
                 {"date": "2025-11-21", "price": 80600.0},
                 {"date": "2025-12-01", "price": 83822.0},
+                {"date": "2025-12-18", "price": 84450.0},
                 {"date": "2026-01-20", "price": 87263.0},
             ],
             transition_event="2026-01-29 downside breakdown followed by selloff into 2026-02-06 low near 60000.",

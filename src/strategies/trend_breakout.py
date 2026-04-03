@@ -15,6 +15,10 @@ RULE_NAMES: tuple[str, ...] = (
     "descending_channel_breakdown",
     "rising_channel_breakdown_retest_short",
     "rising_channel_breakdown_continuation_short",
+    "descending_channel_support_bounce",
+    "ascending_channel_resistance_rejection",
+    "descending_channel_breakout_long",
+    "ascending_channel_breakdown_short",
 )
 
 
@@ -39,7 +43,7 @@ class TrendBreakoutConfig:
     allow_shorts: bool = True
     enable_rising_channel_breakdown_retest_short: bool = True
     enable_rising_channel_breakdown_continuation_short: bool = True
-    parent_structure_lookback: int = 36
+    parent_structure_lookback: int = 90
     parent_pivot_window: int = 2
     parent_min_pivot_highs: int = 2
     parent_min_pivot_lows: int = 2
@@ -48,6 +52,23 @@ class TrendBreakoutConfig:
     shock_reclaim_window_bars: int = 2
     shock_cooldown_bars: int = 8
     breakdown_confirm_bars: int = 2
+    secondary_structure_lookback: int | None = None
+    min_r_squared: float = 0.0
+    min_stop_atr_multiplier: float = 0.0
+    max_atr_price_ratio: float = 0.0
+    trailing_stop_atr: float = 0.0
+    atr_lookback: int = 14
+    enable_descending_channel_support_bounce: bool = True
+    enable_ascending_channel_resistance_rejection: bool = True
+    enable_descending_channel_breakout_long: bool = True
+    enable_ascending_channel_breakdown_short: bool = True
+    require_parent_confirmation: bool = True
+    use_narrative_regime: bool = False
+    use_parent_boundary_targets: bool = False
+    ma_regime_filter: bool = False
+    ma_regime_period: int = 200
+    crowded_long_threshold: float = 0.0
+    crowded_short_threshold: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -104,8 +125,13 @@ class TrendBreakoutStrategy(Strategy):
     def generate_signal(self, symbol: str, bars: list[MarketBar], position: Position) -> StrategySignal:
         return self.evaluate(symbol=symbol, bars=bars, position=position).signal
 
-    def evaluate(self, symbol: str, bars: list[MarketBar], position: Position) -> StrategyEvaluation:
-        del symbol
+    def evaluate(
+        self,
+        symbol: str,
+        bars: list[MarketBar],
+        position: Position,
+        futures_provider: Any | None = None,
+    ) -> StrategyEvaluation:
         required_bars = max(self.config.impulse_lookback, self.config.structure_lookback)
         if len(bars) < required_bars:
             return StrategyEvaluation(
@@ -121,8 +147,22 @@ class TrendBreakoutStrategy(Strategy):
                 parent_context=None,
             )
 
+        # Narrative regime: look up once and reuse below
+        narrative_parent_context = None
+        if self.config.use_narrative_regime:
+            regime = _lookup_narrative_regime_for_bar(bars[-1])
+            if regime is not None:
+                narrative_parent_context = regime.parent_context
+
         recent = bars[-self.config.structure_lookback :]
         channel, channel_failure = _detect_channel(recent, self.config)
+
+        # Dual lookback: if primary fails, try wider window
+        if channel is None and self.config.secondary_structure_lookback is not None:
+            sec_lookback = self.config.secondary_structure_lookback
+            if len(bars) >= sec_lookback:
+                recent = bars[-sec_lookback:]
+                channel, channel_failure = _detect_channel(recent, self.config)
 
         generic_impulse = _detect_impulse_state(
             recent[-self.config.impulse_lookback :],
@@ -138,6 +178,23 @@ class TrendBreakoutStrategy(Strategy):
         )
 
         parent_context = _build_parent_context(bars, self.config)
+
+        # Override parent context with narrative regime if enabled
+        if narrative_parent_context is not None:
+            parent_context = narrative_parent_context
+
+        # Volatility gate: skip when market is too chaotic for structural trades
+        if self.config.max_atr_price_ratio > 0:
+            atr = _compute_atr(recent, self.config.atr_lookback)
+            if atr > 0 and recent[-1].close > 0:
+                ratio = atr / recent[-1].close
+                if ratio > self.config.max_atr_price_ratio:
+                    return StrategyEvaluation(
+                        signal=StrategySignal(action="hold", confidence=0.0, reason="volatility_too_high"),
+                        rule_evaluations=_all_failed("volatility_too_high"),
+                        parent_context=parent_context,
+                    )
+
         context = _build_context(recent, channel, self.config, parent_context)
         rule_evals: list[RuleEvaluation] = []
         winning_signal = StrategySignal(action="hold", confidence=0.0, reason="no_trade_setup")
@@ -149,12 +206,61 @@ class TrendBreakoutStrategy(Strategy):
             self._check_descending_channel_breakdown(context, generic_impulse, channel_failure),
             self._check_rising_channel_breakdown_retest_short(context, front_impulse, channel_failure),
             self._check_rising_channel_breakdown_continuation_short(context, front_impulse, channel_failure),
+            self._check_descending_channel_support_bounce(context, channel_failure),
+            self._check_ascending_channel_resistance_rejection(context, channel_failure),
+            self._check_descending_channel_breakout_long(context, generic_impulse, channel_failure),
+            self._check_ascending_channel_breakdown_short(context, generic_impulse, channel_failure),
         )
 
         for rule_eval, candidate_signal in rule_checks:
             rule_evals.append(rule_eval)
             if candidate_signal is not None and winning_signal.action == "hold":
                 winning_signal = candidate_signal
+
+        # MA regime filter: block longs below SMA, block shorts above SMA
+        if winning_signal.action != "hold" and self.config.ma_regime_filter:
+            sma_val = _compute_sma(bars, self.config.ma_regime_period)
+            if sma_val is not None:
+                current_close = bars[-1].close
+                if winning_signal.action in ("buy",) and current_close < sma_val:
+                    winning_signal = StrategySignal(action="hold", confidence=0.0, reason="ma_regime_blocked_long")
+                elif winning_signal.action in ("short",) and current_close > sma_val:
+                    winning_signal = StrategySignal(action="hold", confidence=0.0, reason="ma_regime_blocked_short")
+
+        # OI / crowded-trade filter: block longs when crowd is too long, shorts when too short
+        if winning_signal.action != "hold" and futures_provider is not None:
+            snapshot = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
+            if snapshot is not None:
+                if winning_signal.action == "buy" and self.config.crowded_long_threshold > 0:
+                    if snapshot.long_pct >= self.config.crowded_long_threshold * 100:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="oi_crowded_long_blocked",
+                        )
+                elif winning_signal.action == "short" and self.config.crowded_short_threshold > 0:
+                    if snapshot.short_pct >= self.config.crowded_short_threshold * 100:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="oi_crowded_short_blocked",
+                        )
+
+        if winning_signal.action != "hold" and self.config.use_parent_boundary_targets:
+            winning_signal = _extend_target_to_parent_boundary(winning_signal, parent_context)
+
+        if winning_signal.action != "hold" and self.config.min_stop_atr_multiplier > 0:
+            winning_signal = _apply_atr_stop_floor(
+                winning_signal, recent, self.config.atr_lookback, self.config.min_stop_atr_multiplier,
+            )
+
+        if winning_signal.action != "hold" and self.config.trailing_stop_atr > 0:
+            meta = dict(winning_signal.metadata) if winning_signal.metadata else {}
+            meta["trailing_stop_atr"] = self.config.trailing_stop_atr
+            winning_signal = StrategySignal(
+                action=winning_signal.action,
+                confidence=winning_signal.confidence,
+                reason=winning_signal.reason,
+                stop_price=winning_signal.stop_price,
+                target_price=winning_signal.target_price,
+                metadata=meta,
+            )
 
         return StrategyEvaluation(signal=winning_signal, rule_evaluations=rule_evals, parent_context=parent_context)
 
@@ -173,6 +279,9 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if generic_impulse != "bullish":
             return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_long_gate_reason(context, self.config.require_parent_confirmation)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
         if context["close"] > context["support"] + context["entry_buffer"]:
             return _failed(rule_name, "price_out_of_entry_zone"), None
         signal = StrategySignal(
@@ -200,6 +309,9 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if generic_impulse != "bullish":
             return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_long_gate_reason(context, self.config.require_parent_confirmation)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
         if context["close"] <= context["resistance"]:
             return _failed(rule_name, "price_out_of_entry_zone"), None
         signal = StrategySignal(
@@ -227,6 +339,9 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if generic_impulse != "bearish":
             return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_short_gate_reason(context, self.config.require_parent_confirmation)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
         if context["close"] < context["resistance"] - context["entry_buffer"]:
             return _failed(rule_name, "price_out_of_entry_zone"), None
         signal = StrategySignal(
@@ -254,6 +369,9 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if generic_impulse != "bearish":
             return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_short_gate_reason(context, self.config.require_parent_confirmation)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
         if context["close"] >= context["support"]:
             return _failed(rule_name, "price_out_of_entry_zone"), None
         signal = StrategySignal(
@@ -281,7 +399,7 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if front_impulse != "bearish":
             return _failed(rule_name, "impulse_mismatch"), None
-        parent_gate_reason = _parent_short_gate_reason(context)
+        parent_gate_reason = _parent_short_gate_reason(context, self.config.require_parent_confirmation)
         if parent_gate_reason is not None:
             return _failed(rule_name, parent_gate_reason, context), None
         if not (context["support"] <= context["close"] <= context["support"] + context["entry_buffer"]):
@@ -314,7 +432,7 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if front_impulse != "bearish":
             return _failed(rule_name, "impulse_mismatch"), None
-        parent_gate_reason = _parent_short_gate_reason(context)
+        parent_gate_reason = _parent_short_gate_reason(context, self.config.require_parent_confirmation)
         if parent_gate_reason is not None:
             return _failed(rule_name, parent_gate_reason, context), None
         if not (
@@ -329,6 +447,126 @@ class TrendBreakoutStrategy(Strategy):
             stop_price=context["support"] + context["stop_buffer"],
             target_price=context["support"] - context["width"],
             metadata={**context, "second_target_price": context["close"] - context["width"]},
+        )
+        return _triggered(rule_name), signal
+
+    def _check_descending_channel_support_bounce(
+        self,
+        context: dict[str, float | str | None],
+        channel_failure: str,
+    ) -> tuple[RuleEvaluation, StrategySignal | None]:
+        rule_name = "descending_channel_support_bounce"
+        if not self.config.allow_longs or not self.config.enable_descending_channel_support_bounce:
+            return _failed(rule_name, "rule_disabled"), None
+        if channel_failure != "ok":
+            return _failed(rule_name, channel_failure), None
+        if context["channel_kind"] != "descending_channel":
+            return _failed(rule_name, "channel_kind_mismatch"), None
+        # Oscillation trade: no impulse required — channel structure + position is the signal
+        gate_reason = _oscillation_long_gate_reason(context, self.config.require_parent_confirmation)
+        if gate_reason is not None:
+            return _failed(rule_name, gate_reason, context), None
+        if context["close"] > context["support"] + context["entry_buffer"]:
+            return _failed(rule_name, "price_out_of_entry_zone"), None
+        signal = StrategySignal(
+            action="buy",
+            confidence=0.70,
+            reason=rule_name,
+            stop_price=context["support"] - context["stop_buffer"],
+            target_price=context["resistance"],
+            metadata={**context},
+        )
+        return _triggered(rule_name), signal
+
+    def _check_ascending_channel_resistance_rejection(
+        self,
+        context: dict[str, float | str | None],
+        channel_failure: str,
+    ) -> tuple[RuleEvaluation, StrategySignal | None]:
+        rule_name = "ascending_channel_resistance_rejection"
+        if not self.config.allow_shorts or not self.config.enable_ascending_channel_resistance_rejection:
+            return _failed(rule_name, "rule_disabled"), None
+        if channel_failure != "ok":
+            return _failed(rule_name, channel_failure), None
+        if context["channel_kind"] != "ascending_channel":
+            return _failed(rule_name, "channel_kind_mismatch"), None
+        # Oscillation trade: no impulse required
+        gate_reason = _oscillation_short_gate_reason(context, self.config.require_parent_confirmation)
+        if gate_reason is not None:
+            return _failed(rule_name, gate_reason, context), None
+        if context["close"] < context["resistance"] - context["entry_buffer"]:
+            return _failed(rule_name, "price_out_of_entry_zone"), None
+        signal = StrategySignal(
+            action="short",
+            confidence=0.70,
+            reason=rule_name,
+            stop_price=context["resistance"] + context["stop_buffer"],
+            target_price=context["support"],
+            metadata={**context},
+        )
+        return _triggered(rule_name), signal
+
+    def _check_descending_channel_breakout_long(
+        self,
+        context: dict[str, float | str | None],
+        generic_impulse: str,
+        channel_failure: str,
+    ) -> tuple[RuleEvaluation, StrategySignal | None]:
+        rule_name = "descending_channel_breakout_long"
+        if not self.config.allow_longs or not self.config.enable_descending_channel_breakout_long:
+            return _failed(rule_name, "rule_disabled"), None
+        if channel_failure != "ok":
+            return _failed(rule_name, channel_failure), None
+        if context["channel_kind"] != "descending_channel":
+            return _failed(rule_name, "channel_kind_mismatch"), None
+        if generic_impulse != "bullish":
+            return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_long_gate_reason(context, self.config.require_parent_confirmation)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
+        if context["close"] <= context["resistance"]:
+            return _failed(rule_name, "price_out_of_entry_zone"), None
+        signal = StrategySignal(
+            action="buy",
+            confidence=0.85,
+            reason=rule_name,
+            stop_price=context["resistance"] - context["stop_buffer"],
+            target_price=context["resistance"] + context["width"],
+            metadata={**context},
+        )
+        return _triggered(rule_name), signal
+
+    def _check_ascending_channel_breakdown_short(
+        self,
+        context: dict[str, float | str | None],
+        generic_impulse: str,
+        channel_failure: str,
+    ) -> tuple[RuleEvaluation, StrategySignal | None]:
+        rule_name = "ascending_channel_breakdown_short"
+        if not self.config.allow_shorts or not self.config.enable_ascending_channel_breakdown_short:
+            return _failed(rule_name, "rule_disabled"), None
+        if channel_failure != "ok":
+            return _failed(rule_name, channel_failure), None
+        if context["channel_kind"] != "ascending_channel":
+            return _failed(rule_name, "channel_kind_mismatch"), None
+        if generic_impulse != "bearish":
+            return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_short_gate_reason(context, self.config.require_parent_confirmation)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
+        # Require close to be meaningfully below support (confirmation buffer)
+        if not (
+            context["close"] < context["support"]
+            and context["close"] <= context["support"] - context["continuation_buffer"]
+        ):
+            return _failed(rule_name, "price_out_of_entry_zone"), None
+        signal = StrategySignal(
+            action="short",
+            confidence=0.85,
+            reason=rule_name,
+            stop_price=context["support"] + context["stop_buffer"],
+            target_price=context["support"] - context["width"],
+            metadata={**context},
         )
         return _triggered(rule_name), signal
 
@@ -537,18 +775,72 @@ def _is_confirmed_breakdown(bars: list[MarketBar], channel: _Channel, confirm_ba
     return True
 
 
-def _parent_short_gate_reason(context: dict[str, float | str | None]) -> str | None:
+def _parent_short_gate_reason(context: dict[str, float | str | None], require_confirmation: bool = True) -> str | None:
+    """Block shorts when parent structure doesn't support bearish thesis."""
     parent_event = context.get("parent_event_type")
     parent_type = context.get("parent_structure_type")
     position = context.get("parent_position_in_channel")
 
     if parent_event in {"shock_break_reclaim", "post_shock_stabilization"}:
         return "shock_override_active"
-    if parent_type == "descending_channel" and position in {"near_lower_boundary", "below_lower_boundary"}:
+    # Don't short when parent structure is unknown — can't confirm regime
+    if require_confirmation and parent_type in {"unknown", None}:
+        return "parent_regime_unknown"
+    # Don't short when parent is ascending and hasn't broken down
+    if parent_type == "ascending_channel" and parent_event != "confirmed_breakdown":
         return "parent_context_conflict"
-    if parent_type == "ascending_channel" and position == "near_lower_boundary":
+    # Don't short near any lower boundary (support zone, regardless of channel type)
+    if position in {"near_lower_boundary", "below_lower_boundary"}:
         return "parent_context_conflict"
-    if parent_type == "ascending_channel" and position == "below_lower_boundary" and parent_event != "confirmed_breakdown":
+    return None
+
+
+def _oscillation_short_gate_reason(context: dict[str, float | str | None], require_confirmation: bool = True) -> str | None:
+    """Lighter gate for counter-trend oscillation shorts (e.g. resistance rejection in ascending channel).
+
+    Only blocks at shock events — does NOT filter on parent trend direction,
+    because oscillation trades rely on channel structure + price position, not momentum.
+    """
+    parent_event = context.get("parent_event_type")
+    if parent_event in {"shock_break_reclaim", "post_shock_stabilization"}:
+        return "shock_override_active"
+    if require_confirmation and context.get("parent_structure_type") in {"unknown", None}:
+        return "parent_regime_unknown"
+    return None
+
+
+def _oscillation_long_gate_reason(context: dict[str, float | str | None], require_confirmation: bool = True) -> str | None:
+    """Lighter gate for counter-trend oscillation longs (e.g. support bounce in descending channel).
+
+    Only blocks at shock events — does NOT filter on parent trend direction.
+    """
+    parent_event = context.get("parent_event_type")
+    if parent_event in {"shock_break_reclaim", "post_shock_stabilization"}:
+        return "shock_override_active"
+    if require_confirmation and context.get("parent_structure_type") in {"unknown", None}:
+        return "parent_regime_unknown"
+    return None
+
+
+def _parent_long_gate_reason(context: dict[str, float | str | None], require_confirmation: bool = True) -> str | None:
+    """Block longs when parent structure doesn't support bullish thesis."""
+    parent_event = context.get("parent_event_type")
+    parent_type = context.get("parent_structure_type")
+    position = context.get("parent_position_in_channel")
+
+    if parent_event in {"shock_break_reclaim", "post_shock_stabilization"}:
+        return "shock_override_active"
+    # Don't buy when parent structure is unknown — can't confirm regime
+    if require_confirmation and parent_type in {"unknown", None}:
+        return "parent_regime_unknown"
+    # Don't buy when parent is descending and hasn't broken out
+    if parent_type == "descending_channel" and parent_event != "confirmed_breakdown":
+        return "parent_context_conflict"
+    # Don't buy when ascending channel has confirmed breakdown (structure failed)
+    if parent_type == "ascending_channel" and parent_event == "confirmed_breakdown":
+        return "parent_context_conflict"
+    # Don't buy near resistance of ascending channel (reversal zone)
+    if parent_type == "ascending_channel" and position in {"near_upper_boundary", "above_upper_boundary"}:
         return "parent_context_conflict"
     return None
 
@@ -600,6 +892,12 @@ def _detect_channel(
     scale = max(abs(resistance_slope), abs(support_slope), 1e-9)
     if abs(resistance_slope - support_slope) / scale > config.max_slope_divergence_ratio:
         return None, "slope_divergence_too_large"
+
+    if config.min_r_squared > 0:
+        r2_res = _r_squared([pivot.index for pivot in highs], [pivot.price for pivot in highs], resistance_slope, resistance_intercept)
+        r2_sup = _r_squared([pivot.index for pivot in lows], [pivot.price for pivot in lows], support_slope, support_intercept)
+        if min(r2_res, r2_sup) < config.min_r_squared:
+            return None, "r_squared_too_low"
 
     last_index = len(bars) - 1
     width = ((resistance_slope * last_index) + resistance_intercept) - ((support_slope * last_index) + support_intercept)
@@ -656,6 +954,111 @@ def _linear_fit(x_values: list[int], y_values: list[float]) -> tuple[float, floa
     return slope, intercept
 
 
+def _r_squared(x_values: list[int], y_values: list[float], slope: float, intercept: float) -> float:
+    """Coefficient of determination (R²) for a linear fit."""
+    y_mean = mean(y_values)
+    ss_tot = sum((y - y_mean) ** 2 for y in y_values)
+    if ss_tot == 0:
+        return 1.0
+    ss_res = sum((y - (slope * x + intercept)) ** 2 for x, y in zip(x_values, y_values))
+    return 1.0 - (ss_res / ss_tot)
+
+
+def _compute_sma(bars: list[MarketBar], period: int) -> float | None:
+    """Simple Moving Average of close prices over the last `period` bars."""
+    if len(bars) < period:
+        return None
+    return mean(bar.close for bar in bars[-period:])
+
+
+def _compute_atr(bars: list[MarketBar], lookback: int) -> float:
+    """Average True Range over the last `lookback` bars."""
+    window = bars[-lookback:] if len(bars) >= lookback else bars
+    if len(window) < 2:
+        return 0.0
+    true_ranges: list[float] = []
+    prev_close = window[0].close
+    for bar in window[1:]:
+        true_ranges.append(max(bar.high - bar.low, abs(bar.high - prev_close), abs(bar.low - prev_close)))
+        prev_close = bar.close
+    return mean(true_ranges) if true_ranges else 0.0
+
+
+def _extend_target_to_parent_boundary(
+    signal: StrategySignal,
+    parent_context: dict[str, float | str | None] | None,
+) -> StrategySignal:
+    """Extend the target price to the parent channel boundary when it's further
+    in the profitable direction than the local channel target."""
+    if parent_context is None or signal.target_price is None:
+        return signal
+    if signal.action == "short":
+        parent_lower = parent_context.get("parent_lower_boundary")
+        if parent_lower is not None and isinstance(parent_lower, (int, float)) and parent_lower < signal.target_price:
+            return StrategySignal(
+                action=signal.action,
+                confidence=signal.confidence,
+                reason=signal.reason,
+                stop_price=signal.stop_price,
+                target_price=parent_lower,
+                metadata=signal.metadata,
+            )
+    elif signal.action == "buy":
+        parent_upper = parent_context.get("parent_upper_boundary")
+        if parent_upper is not None and isinstance(parent_upper, (int, float)) and parent_upper > signal.target_price:
+            return StrategySignal(
+                action=signal.action,
+                confidence=signal.confidence,
+                reason=signal.reason,
+                stop_price=signal.stop_price,
+                target_price=parent_upper,
+                metadata=signal.metadata,
+            )
+    return signal
+
+
+def _apply_atr_stop_floor(
+    signal: StrategySignal,
+    bars: list[MarketBar],
+    atr_lookback: int,
+    atr_multiplier: float,
+) -> StrategySignal:
+    """Widen the stop to at least atr_multiplier * ATR from entry price."""
+    if signal.stop_price is None:
+        return signal
+    atr = _compute_atr(bars, atr_lookback)
+    if atr == 0:
+        return signal
+    min_distance = atr * atr_multiplier
+    entry_price = signal.metadata.get("close", bars[-1].close) if signal.metadata else bars[-1].close
+
+    if signal.action in ("short",):
+        # Short: stop is above entry
+        min_stop = entry_price + min_distance
+        if signal.stop_price < min_stop:
+            return StrategySignal(
+                action=signal.action,
+                confidence=signal.confidence,
+                reason=signal.reason,
+                stop_price=min_stop,
+                target_price=signal.target_price,
+                metadata=signal.metadata,
+            )
+    elif signal.action in ("buy",):
+        # Long: stop is below entry
+        min_stop = entry_price - min_distance
+        if signal.stop_price > min_stop:
+            return StrategySignal(
+                action=signal.action,
+                confidence=signal.confidence,
+                reason=signal.reason,
+                stop_price=min_stop,
+                target_price=signal.target_price,
+                metadata=signal.metadata,
+            )
+    return signal
+
+
 def _atr_expansion_ratio(bars: list[MarketBar]) -> float:
     if len(bars) < 2:
         return 0.0
@@ -681,3 +1084,15 @@ def _volume_expansion_ratio(bars: list[MarketBar]) -> float:
     if baseline == 0:
         return 0.0
     return latest / baseline
+
+
+# ── Narrative regime integration ────────────────────────────────────
+
+
+def _lookup_narrative_regime_for_bar(bar: MarketBar):
+    """Look up the narrative regime for a bar's date.  Returns None on import failure."""
+    try:
+        from research.narrative_regime import lookup_narrative_regime
+    except ImportError:
+        return None
+    return lookup_narrative_regime(bar.timestamp.date(), current_price=bar.close)

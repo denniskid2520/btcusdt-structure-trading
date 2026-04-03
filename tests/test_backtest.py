@@ -9,6 +9,7 @@ from research.backtest import (
 )
 from risk.limits import RiskLimits
 from strategies.trend_breakout import TrendBreakoutConfig, TrendBreakoutStrategy
+from strategies.trend_breakout import TrendBreakoutConfig, TrendBreakoutStrategy
 from tests.fixtures_synthetic_bars import (
     realistic_comparison_dataset_bars,
     rising_channel_continuation_short_bars,
@@ -44,6 +45,7 @@ def test_backtest_trade_log_records_entry_rule_and_exit_reason() -> None:
                 entry_buffer_pct=0.35,
                 stop_buffer_pct=0.08,
                 allow_longs=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -69,6 +71,7 @@ def test_backtest_rule_stats_include_new_short_rules_on_synthetic_bars() -> None
                 entry_buffer_pct=0.35,
                 stop_buffer_pct=0.08,
                 allow_longs=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -86,6 +89,7 @@ def test_backtest_rule_stats_include_new_short_rules_on_synthetic_bars() -> None
                 stop_buffer_pct=0.08,
                 allow_longs=False,
                 enable_rising_channel_breakdown_retest_short=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -129,6 +133,7 @@ def test_backtest_rule_contribution_uses_total_realized_pnl_denominator() -> Non
                 entry_buffer_pct=0.35,
                 stop_buffer_pct=0.08,
                 allow_longs=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -156,6 +161,7 @@ def test_backtest_baseline_vs_enhanced_comparison_path_on_realistic_dataset() ->
         continuation_buffer_pct=0.45,
         stop_buffer_pct=0.08,
         allow_longs=False,
+        require_parent_confirmation=False,
     )
     comparison = compare_baseline_enhanced(
         bars=bars,
@@ -217,3 +223,21 @@ def test_event_markers_are_clustered_at_event_level() -> None:
     assert clustered[0].bars == 2
     assert clustered[0].event_label == "major_descending_channel_lower_boundary_support_context"
     assert clustered[1].event_label == "shock_break_reclaim_context"
+
+
+def test_build_default_strategy_includes_quality_filters() -> None:
+    """Default strategy must include quality filters and tuned parameters."""
+    strategy = build_default_strategy()
+    config: TrendBreakoutConfig = strategy.config
+    assert config.min_r_squared >= 0, "R² filter configurable"
+    assert config.min_stop_atr_multiplier >= 1.0, "ATR stop floor should prevent noise stop-outs"
+    assert config.impulse_threshold_pct <= 0.03, "Lower impulse threshold captures more setups"
+    assert config.time_stop_bars is not None and config.time_stop_bars > 0, "Time stop cuts losing trades"
+    assert config.use_narrative_regime is True
+    assert config.secondary_structure_lookback is not None, "Dual lookback captures more regimes"
+
+
+def test_risk_limits_use_futures_leverage() -> None:
+    """Perpetual futures should use higher position size than spot."""
+    limits = RiskLimits()
+    assert limits.max_position_pct >= 0.5, "Futures should use at least 50% position sizing"

@@ -90,6 +90,7 @@ def run_backtest(
     strategy: Strategy,
     broker: PaperBroker,
     limits: RiskLimits,
+    futures_provider: Any | None = None,
 ) -> BacktestResult:
     if len(bars) < 2:
         raise ValueError("Backtest requires at least two bars.")
@@ -111,7 +112,33 @@ def run_backtest(
         position = broker.get_position(symbol)
         order: OrderRequest | None = None
 
-        if position.is_open and symbol in open_entries and time_stop_bars is not None:
+        # Trailing stop: update best price and check stop
+        if position.is_open and symbol in open_entries:
+            entry_info = open_entries[symbol]
+            trail_atr = entry_info.get("trailing_stop_atr", 0)
+            if trail_atr and trail_atr > 0:
+                atr = _compute_trailing_atr(bars[: index + 1], 14)
+                if atr > 0:
+                    if entry_info["side"] == "short":
+                        entry_info["best_price"] = min(entry_info["best_price"], current_bar.low)
+                        trail_stop = entry_info["best_price"] + trail_atr * atr
+                        if current_bar.close >= trail_stop:
+                            order = OrderRequest(
+                                symbol=symbol, side="cover", quantity=position.quantity,
+                                timestamp=current_bar.timestamp,
+                                metadata={"reason": "trailing_stop"},
+                            )
+                    elif entry_info["side"] == "buy":
+                        entry_info["best_price"] = max(entry_info["best_price"], current_bar.high)
+                        trail_stop = entry_info["best_price"] - trail_atr * atr
+                        if current_bar.close <= trail_stop:
+                            order = OrderRequest(
+                                symbol=symbol, side="sell", quantity=position.quantity,
+                                timestamp=current_bar.timestamp,
+                                metadata={"reason": "trailing_stop"},
+                            )
+
+        if order is None and position.is_open and symbol in open_entries and time_stop_bars is not None:
             bars_held = index - open_entries[symbol]["entry_index"]
             if bars_held >= time_stop_bars:
                 order = OrderRequest(
@@ -123,7 +150,7 @@ def run_backtest(
                 )
 
         if order is None:
-            signal, evaluation = _evaluate_strategy(strategy=strategy, symbol=symbol, history=history, position=position)
+            signal, evaluation = _evaluate_strategy(strategy=strategy, symbol=symbol, history=history, position=position, futures_provider=futures_provider)
             if evaluation is not None:
                 for item in evaluation.rule_evaluations:
                     rule_eval_counts[item.rule_name] = rule_eval_counts.get(item.rule_name, 0) + 1
@@ -145,17 +172,20 @@ def run_backtest(
                     market_price=current_bar.close,
                     limits=limits,
                 )
+                entry_metadata = {
+                    "reason": signal.reason,
+                    "stop_price": signal.stop_price,
+                    "target_price": signal.target_price,
+                    "second_target_price": signal.metadata.get("second_target_price") if signal.metadata else None,
+                }
+                if signal.metadata and signal.metadata.get("trailing_stop_atr"):
+                    entry_metadata["trailing_stop_atr"] = signal.metadata["trailing_stop_atr"]
                 order = OrderRequest(
                     symbol=symbol,
                     side=signal.action,
                     quantity=quantity,
                     timestamp=current_bar.timestamp,
-                    metadata={
-                        "reason": signal.reason,
-                        "stop_price": signal.stop_price,
-                        "target_price": signal.target_price,
-                        "second_target_price": signal.metadata.get("second_target_price"),
-                    },
+                    metadata=entry_metadata,
                 )
             elif signal.action in {"sell", "cover"}:
                 order = OrderRequest(
@@ -186,6 +216,8 @@ def run_backtest(
                         "entry_price": fill.fill_price,
                         "entry_fee": fill.fee,
                         "entry_index": index,
+                        "trailing_stop_atr": order.metadata.get("trailing_stop_atr", 0),
+                        "best_price": fill.fill_price,
                     }
                 elif fill.side in {"sell", "cover"} and fill.symbol in open_entries:
                     entry = open_entries.pop(fill.symbol)
@@ -278,17 +310,25 @@ def compare_baseline_enhanced(
     return BacktestComparison(baseline=baseline, enhanced=enhanced)
 
 
-def build_default_strategy() -> TrendBreakoutStrategy:
+def build_default_strategy(use_narrative_regime: bool = True) -> TrendBreakoutStrategy:
     return TrendBreakoutStrategy(
         TrendBreakoutConfig(
             impulse_lookback=12,
             structure_lookback=24,
+            secondary_structure_lookback=48,
             pivot_window=2,
             min_pivot_highs=2,
             min_pivot_lows=2,
-            impulse_threshold_pct=0.03,
-            entry_buffer_pct=0.18,
+            impulse_threshold_pct=0.02,
+            entry_buffer_pct=0.20,
             stop_buffer_pct=0.08,
+            min_r_squared=0.0,
+            min_stop_atr_multiplier=1.5,
+            time_stop_bars=84,
+            use_narrative_regime=use_narrative_regime,
+            enable_ascending_channel_resistance_rejection=False,
+            enable_descending_channel_breakout_long=False,
+            enable_ascending_channel_breakdown_short=False,
         )
     )
 
@@ -361,10 +401,11 @@ def _evaluate_strategy(
     symbol: str,
     history: list[MarketBar],
     position,
+    futures_provider: Any | None = None,
 ) -> tuple[StrategySignal, StrategyEvaluation | None]:
     evaluate_fn = getattr(strategy, "evaluate", None)
     if callable(evaluate_fn):
-        evaluation = evaluate_fn(symbol=symbol, bars=history, position=position)
+        evaluation = evaluate_fn(symbol=symbol, bars=history, position=position, futures_provider=futures_provider)
         return evaluation.signal, evaluation
     return strategy.generate_signal(symbol=symbol, bars=history, position=position), None
 
@@ -468,12 +509,20 @@ def _build_rule_stats(signal_counts: dict[str, int], trades: list[TradeRecord]) 
     return stats
 
 
+def _compute_trailing_atr(bars: list[MarketBar], lookback: int) -> float:
+    window = bars[-lookback:] if len(bars) >= lookback else bars
+    if len(window) < 2:
+        return 0.0
+    from statistics import mean
+    true_ranges: list[float] = []
+    prev_close = window[0].close
+    for bar in window[1:]:
+        true_ranges.append(max(bar.high - bar.low, abs(bar.high - prev_close), abs(bar.low - prev_close)))
+        prev_close = bar.close
+    return mean(true_ranges) if true_ranges else 0.0
+
+
 def _build_event_marker(timestamp: datetime, evaluation_item) -> dict[str, Any] | None:
-    if evaluation_item.rule_name not in {
-        "rising_channel_breakdown_retest_short",
-        "rising_channel_breakdown_continuation_short",
-    }:
-        return None
     if evaluation_item.first_failed_condition not in {"parent_context_conflict", "shock_override_active"}:
         return None
     context = evaluation_item.context or {}

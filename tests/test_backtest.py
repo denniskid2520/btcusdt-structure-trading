@@ -1,6 +1,7 @@
 from adapters.binance_stub import BinanceStubAdapter
 from execution.paper_broker import PaperBroker
 from research.backtest import (
+    _cluster_event_markers,
     build_baseline_strategy,
     build_default_strategy,
     compare_baseline_enhanced,
@@ -179,3 +180,40 @@ def test_backtest_baseline_vs_enhanced_comparison_path_on_realistic_dataset() ->
         if stat.signal_name in {"rising_channel_breakdown_retest_short", "rising_channel_breakdown_continuation_short"}
     ]
     assert sum(rising_fills) > 0
+
+
+def test_event_markers_are_clustered_at_event_level() -> None:
+    markers = [
+        {
+            "timestamp": BinanceStubAdapter().fetch_ohlcv("BTCUSDT", "1h", 3)[0].timestamp,
+            "rule_name": "rising_channel_breakdown_retest_short",
+            "first_failed_condition": "parent_context_conflict",
+            "parent_structure_type": "descending_channel",
+            "parent_position_in_channel": "near_lower_boundary",
+            "parent_event_type": "normal",
+            "event_label": "major_descending_channel_lower_boundary_support_context",
+        },
+        {
+            "timestamp": BinanceStubAdapter().fetch_ohlcv("BTCUSDT", "1h", 3)[1].timestamp,
+            "rule_name": "rising_channel_breakdown_continuation_short",
+            "first_failed_condition": "parent_context_conflict",
+            "parent_structure_type": "descending_channel",
+            "parent_position_in_channel": "near_lower_boundary",
+            "parent_event_type": "normal",
+            "event_label": "major_descending_channel_lower_boundary_support_context",
+        },
+        {
+            "timestamp": BinanceStubAdapter().fetch_ohlcv("BTCUSDT", "1h", 3)[2].timestamp,
+            "rule_name": "rising_channel_breakdown_retest_short",
+            "first_failed_condition": "shock_override_active",
+            "parent_structure_type": "ascending_channel",
+            "parent_position_in_channel": "below_lower_boundary",
+            "parent_event_type": "shock_break_reclaim",
+            "event_label": "shock_break_reclaim_context",
+        },
+    ]
+    clustered = _cluster_event_markers(markers)
+    assert len(clustered) == 2
+    assert clustered[0].bars == 2
+    assert clustered[0].event_label == "major_descending_channel_lower_boundary_support_context"
+    assert clustered[1].event_label == "shock_break_reclaim_context"

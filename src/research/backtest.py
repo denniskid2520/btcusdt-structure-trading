@@ -51,6 +51,19 @@ class RuleStat:
 
 
 @dataclass(frozen=True)
+class EventReviewRecord:
+    event_label: str
+    first_failed_condition: str
+    start_time: datetime
+    end_time: datetime
+    bars: int
+    parent_structure_type: str
+    parent_position_in_channel: str
+    parent_event_type: str
+    rule_names: list[str]
+
+
+@dataclass(frozen=True)
 class BacktestResult:
     initial_cash: float
     final_equity: float
@@ -62,6 +75,7 @@ class BacktestResult:
     rule_stats: list[RuleStat]
     rejection_stats: dict[str, dict[str, int]]
     rule_eval_counts: dict[str, int]
+    event_review_pack: list[EventReviewRecord]
 
 
 @dataclass(frozen=True)
@@ -88,6 +102,7 @@ def run_backtest(
     open_entries: dict[str, dict[str, Any]] = {}
     rejection_stats: dict[str, dict[str, int]] = {name: {} for name in RULE_NAMES}
     rule_eval_counts: dict[str, int] = {name: 0 for name in RULE_NAMES}
+    event_markers: list[dict[str, Any]] = []
     time_stop_bars = getattr(getattr(strategy, "config", None), "time_stop_bars", None)
 
     for index in range(1, len(bars)):
@@ -118,6 +133,9 @@ def run_backtest(
                         bucket = rejection_stats.setdefault(item.rule_name, {})
                         reason = item.first_failed_condition
                         bucket[reason] = bucket.get(reason, 0) + 1
+                        marker = _build_event_marker(current_bar.timestamp, item)
+                        if marker is not None:
+                            event_markers.append(marker)
             elif signal.action in {"buy", "short"} and signal.reason:
                 signal_counts[signal.reason] = signal_counts.get(signal.reason, 0) + 1
 
@@ -224,6 +242,7 @@ def run_backtest(
         rule_stats=_build_rule_stats(signal_counts, trades),
         rejection_stats={rule: reasons for rule, reasons in rejection_stats.items() if reasons},
         rule_eval_counts=rule_eval_counts,
+        event_review_pack=_cluster_event_markers(event_markers),
     )
 
 
@@ -369,6 +388,14 @@ def _print_result(label: str, result: BacktestResult) -> None:
         for rule_name in sorted(result.rejection_stats):
             parts = ", ".join(f"{reason}={count}" for reason, count in sorted(result.rejection_stats[rule_name].items()))
             print(f"{rule_name}: {parts}")
+    if result.event_review_pack:
+        print("Event Review Pack")
+        for event in result.event_review_pack:
+            print(
+                f"{event.event_label}: bars={event.bars} "
+                f"{event.start_time.isoformat()} -> {event.end_time.isoformat()} "
+                f"parent={event.parent_structure_type}/{event.parent_position_in_channel}/{event.parent_event_type}"
+            )
 
 
 def _count_open_positions(broker: PaperBroker, symbol: str) -> int:
@@ -439,6 +466,95 @@ def _build_rule_stats(signal_counts: dict[str, int], trades: list[TradeRecord]) 
             )
         )
     return stats
+
+
+def _build_event_marker(timestamp: datetime, evaluation_item) -> dict[str, Any] | None:
+    if evaluation_item.rule_name not in {
+        "rising_channel_breakdown_retest_short",
+        "rising_channel_breakdown_continuation_short",
+    }:
+        return None
+    if evaluation_item.first_failed_condition not in {"parent_context_conflict", "shock_override_active"}:
+        return None
+    context = evaluation_item.context or {}
+    parent_type = str(context.get("parent_structure_type", "unknown"))
+    parent_position = str(context.get("parent_position_in_channel", "unknown"))
+    parent_event = str(context.get("parent_event_type", "none"))
+    return {
+        "timestamp": timestamp,
+        "rule_name": evaluation_item.rule_name,
+        "first_failed_condition": evaluation_item.first_failed_condition,
+        "parent_structure_type": parent_type,
+        "parent_position_in_channel": parent_position,
+        "parent_event_type": parent_event,
+        "event_label": _reclassify_event_label(
+            first_failed_condition=evaluation_item.first_failed_condition,
+            parent_structure_type=parent_type,
+            parent_position_in_channel=parent_position,
+            parent_event_type=parent_event,
+        ),
+    }
+
+
+def _reclassify_event_label(
+    first_failed_condition: str,
+    parent_structure_type: str,
+    parent_position_in_channel: str,
+    parent_event_type: str,
+) -> str:
+    if first_failed_condition == "shock_override_active" or parent_event_type in {
+        "shock_break_reclaim",
+        "post_shock_stabilization",
+    }:
+        if parent_event_type == "post_shock_stabilization":
+            return "post_shock_stabilization_context"
+        return "shock_break_reclaim_context"
+    if parent_structure_type == "descending_channel" and parent_position_in_channel in {
+        "near_lower_boundary",
+        "below_lower_boundary",
+    }:
+        return "major_descending_channel_lower_boundary_support_context"
+    if parent_structure_type == "ascending_channel" and parent_position_in_channel in {
+        "near_lower_boundary",
+        "below_lower_boundary",
+    }:
+        return "major_ascending_channel_lower_boundary_support_reaction_context"
+    return "parent_context_conflict"
+
+
+def _cluster_event_markers(markers: list[dict[str, Any]]) -> list[EventReviewRecord]:
+    if not markers:
+        return []
+    records: list[EventReviewRecord] = []
+    markers = sorted(markers, key=lambda item: item["timestamp"])
+    cluster: list[dict[str, Any]] = [markers[0]]
+    for item in markers[1:]:
+        previous = cluster[-1]
+        if (
+            item["event_label"] == previous["event_label"]
+            and item["parent_structure_type"] == previous["parent_structure_type"]
+            and item["parent_event_type"] == previous["parent_event_type"]
+        ):
+            cluster.append(item)
+            continue
+        records.append(_cluster_to_record(cluster))
+        cluster = [item]
+    records.append(_cluster_to_record(cluster))
+    return records
+
+
+def _cluster_to_record(cluster: list[dict[str, Any]]) -> EventReviewRecord:
+    return EventReviewRecord(
+        event_label=cluster[0]["event_label"],
+        first_failed_condition=cluster[0]["first_failed_condition"],
+        start_time=cluster[0]["timestamp"],
+        end_time=cluster[-1]["timestamp"],
+        bars=len(cluster),
+        parent_structure_type=cluster[0]["parent_structure_type"],
+        parent_position_in_channel=cluster[0]["parent_position_in_channel"],
+        parent_event_type=cluster[0]["parent_event_type"],
+        rule_names=sorted({item["rule_name"] for item in cluster}),
+    )
 
 
 if __name__ == "__main__":

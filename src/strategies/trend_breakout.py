@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from statistics import mean
+from typing import Any
 
 from adapters.base import MarketBar, Position
 from strategies.base import Strategy, StrategySignal
@@ -38,6 +39,15 @@ class TrendBreakoutConfig:
     allow_shorts: bool = True
     enable_rising_channel_breakdown_retest_short: bool = True
     enable_rising_channel_breakdown_continuation_short: bool = True
+    parent_structure_lookback: int = 36
+    parent_pivot_window: int = 2
+    parent_min_pivot_highs: int = 2
+    parent_min_pivot_lows: int = 2
+    parent_timeframe_factor: int = 6
+    parent_boundary_zone_pct: float = 0.2
+    shock_reclaim_window_bars: int = 2
+    shock_cooldown_bars: int = 8
+    breakdown_confirm_bars: int = 2
 
 
 @dataclass(frozen=True)
@@ -46,12 +56,14 @@ class RuleEvaluation:
     eligible: bool
     triggered: bool
     first_failed_condition: str | None
+    context: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
 class StrategyEvaluation:
     signal: StrategySignal
     rule_evaluations: list[RuleEvaluation]
+    parent_context: dict[str, float | str | None] | None = None
 
 
 @dataclass(frozen=True)
@@ -77,6 +89,12 @@ class _Channel:
         return (self.resistance_slope * index) + self.resistance_intercept
 
 
+@dataclass(frozen=True)
+class _ParentEvent:
+    event_type: str
+    bars_since_event: int | None = None
+
+
 class TrendBreakoutStrategy(Strategy):
     """Parameterized channel trend breakout strategy with evaluation funnel."""
 
@@ -93,12 +111,14 @@ class TrendBreakoutStrategy(Strategy):
             return StrategyEvaluation(
                 signal=StrategySignal(action="hold", confidence=0.0, reason="insufficient_bars"),
                 rule_evaluations=_all_failed("insufficient_bars"),
+                parent_context=None,
             )
 
         if position.is_open:
             return StrategyEvaluation(
                 signal=self._manage_open_position(position, bars[-1].close),
                 rule_evaluations=_all_failed("position_open"),
+                parent_context=None,
             )
 
         recent = bars[-self.config.structure_lookback :]
@@ -117,7 +137,8 @@ class TrendBreakoutStrategy(Strategy):
             self.config.impulse_volume_expansion_min,
         )
 
-        context = _build_context(recent, channel, self.config)
+        parent_context = _build_parent_context(bars, self.config)
+        context = _build_context(recent, channel, self.config, parent_context)
         rule_evals: list[RuleEvaluation] = []
         winning_signal = StrategySignal(action="hold", confidence=0.0, reason="no_trade_setup")
 
@@ -135,7 +156,7 @@ class TrendBreakoutStrategy(Strategy):
             if candidate_signal is not None and winning_signal.action == "hold":
                 winning_signal = candidate_signal
 
-        return StrategyEvaluation(signal=winning_signal, rule_evaluations=rule_evals)
+        return StrategyEvaluation(signal=winning_signal, rule_evaluations=rule_evals, parent_context=parent_context)
 
     def _check_ascending_channel_support_bounce(
         self,
@@ -260,6 +281,9 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if front_impulse != "bearish":
             return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_short_gate_reason(context)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
         if not (context["support"] <= context["close"] <= context["support"] + context["entry_buffer"]):
             return _failed(rule_name, "price_out_of_entry_zone"), None
 
@@ -290,6 +314,9 @@ class TrendBreakoutStrategy(Strategy):
             return _failed(rule_name, "channel_kind_mismatch"), None
         if front_impulse != "bearish":
             return _failed(rule_name, "impulse_mismatch"), None
+        parent_gate_reason = _parent_short_gate_reason(context)
+        if parent_gate_reason is not None:
+            return _failed(rule_name, parent_gate_reason, context), None
         if not (
             context["close"] < context["support"]
             and context["close"] >= context["support"] - context["continuation_buffer"]
@@ -326,8 +353,14 @@ def _all_failed(reason: str) -> list[RuleEvaluation]:
     return [RuleEvaluation(rule_name=name, eligible=False, triggered=False, first_failed_condition=reason) for name in RULE_NAMES]
 
 
-def _failed(rule_name: str, reason: str) -> RuleEvaluation:
-    return RuleEvaluation(rule_name=rule_name, eligible=False, triggered=False, first_failed_condition=reason)
+def _failed(rule_name: str, reason: str, context: dict[str, Any] | None = None) -> RuleEvaluation:
+    return RuleEvaluation(
+        rule_name=rule_name,
+        eligible=False,
+        triggered=False,
+        first_failed_condition=reason,
+        context=context,
+    )
 
 
 def _triggered(rule_name: str) -> RuleEvaluation:
@@ -338,8 +371,10 @@ def _build_context(
     recent: list[MarketBar],
     channel: _Channel | None,
     config: TrendBreakoutConfig,
+    parent_context: dict[str, float | str | None] | None,
 ) -> dict[str, float | str | None]:
     current = recent[-1]
+    parent_context = parent_context or _empty_parent_context()
     if channel is None:
         return {
             "channel_kind": None,
@@ -351,6 +386,7 @@ def _build_context(
             "entry_buffer": 0.0,
             "continuation_buffer": 0.0,
             "stop_buffer": 0.0,
+            **parent_context,
         }
 
     index = len(recent) - 1
@@ -367,7 +403,154 @@ def _build_context(
         "entry_buffer": width * config.entry_buffer_pct,
         "continuation_buffer": width * config.continuation_buffer_pct,
         "stop_buffer": width * config.stop_buffer_pct,
+        **parent_context,
     }
+
+
+def _empty_parent_context() -> dict[str, float | str | None]:
+    return {
+        "parent_structure_type": "unknown",
+        "parent_upper_boundary": None,
+        "parent_lower_boundary": None,
+        "parent_position_in_channel": "unknown",
+        "parent_event_type": "none",
+    }
+
+
+def _resample_bars_for_parent(bars: list[MarketBar], factor: int) -> list[MarketBar]:
+    if factor <= 1:
+        return bars
+    resampled: list[MarketBar] = []
+    for index in range(0, len(bars), factor):
+        chunk = bars[index : index + factor]
+        if len(chunk) < factor:
+            continue
+        resampled.append(
+            MarketBar(
+                timestamp=chunk[-1].timestamp,
+                open=chunk[0].open,
+                high=max(item.high for item in chunk),
+                low=min(item.low for item in chunk),
+                close=chunk[-1].close,
+                volume=sum(item.volume for item in chunk),
+            )
+        )
+    return resampled
+
+
+def _build_parent_context(
+    bars: list[MarketBar],
+    config: TrendBreakoutConfig,
+) -> dict[str, float | str | None]:
+    parent_bars = _resample_bars_for_parent(bars, config.parent_timeframe_factor)
+    lookback = min(config.parent_structure_lookback, len(parent_bars))
+    if lookback < max(config.parent_pivot_window * 2 + 1, config.parent_min_pivot_highs + config.parent_min_pivot_lows):
+        return _empty_parent_context()
+    window = parent_bars[-lookback:]
+    parent_channel, failure = _detect_channel(
+        window,
+        TrendBreakoutConfig(
+            pivot_window=config.parent_pivot_window,
+            min_pivot_highs=config.parent_min_pivot_highs,
+            min_pivot_lows=config.parent_min_pivot_lows,
+            max_slope_divergence_ratio=config.max_slope_divergence_ratio,
+            min_channel_width_abs=config.min_channel_width_abs,
+            min_channel_width_pct=config.min_channel_width_pct,
+        ),
+    )
+    if failure != "ok" or parent_channel is None:
+        return _empty_parent_context()
+
+    last_index = len(window) - 1
+    upper = parent_channel.resistance_at(last_index)
+    lower = parent_channel.support_at(last_index)
+    width = max(upper - lower, 1e-9)
+    close = window[-1].close
+    zone = width * config.parent_boundary_zone_pct
+    if close < lower:
+        position = "below_lower_boundary"
+    elif close > upper:
+        position = "above_upper_boundary"
+    elif close <= lower + zone:
+        position = "near_lower_boundary"
+    elif close >= upper - zone:
+        position = "near_upper_boundary"
+    else:
+        position = "mid_channel"
+
+    event = _detect_parent_event_type(window, parent_channel, config)
+    return {
+        "parent_structure_type": parent_channel.kind,
+        "parent_upper_boundary": upper,
+        "parent_lower_boundary": lower,
+        "parent_position_in_channel": position,
+        "parent_event_type": event.event_type,
+    }
+
+
+def _detect_parent_event_type(
+    bars: list[MarketBar],
+    channel: _Channel,
+    config: TrendBreakoutConfig,
+) -> _ParentEvent:
+    if len(bars) < 3:
+        return _ParentEvent(event_type="normal")
+
+    last_index = len(bars) - 1
+    lower = channel.support_at(last_index)
+    close = bars[-1].close
+
+    if _is_confirmed_breakdown(bars, channel, config.breakdown_confirm_bars):
+        return _ParentEvent(event_type="confirmed_breakdown", bars_since_event=0)
+
+    shock_index = _find_recent_shock_reclaim_index(bars, channel)
+    if shock_index is None:
+        return _ParentEvent(event_type="normal")
+
+    bars_since = (len(bars) - 1) - shock_index
+    if bars_since <= config.shock_reclaim_window_bars:
+        return _ParentEvent(event_type="shock_break_reclaim", bars_since_event=bars_since)
+    if bars_since <= config.shock_cooldown_bars:
+        return _ParentEvent(event_type="post_shock_stabilization", bars_since_event=bars_since)
+    if close < lower:
+        return _ParentEvent(event_type="confirmed_breakdown", bars_since_event=bars_since)
+    return _ParentEvent(event_type="normal", bars_since_event=bars_since)
+
+
+def _find_recent_shock_reclaim_index(bars: list[MarketBar], channel: _Channel) -> int | None:
+    for index in range(len(bars) - 2, 0, -1):
+        lower = channel.support_at(index)
+        bar = bars[index]
+        if bar.low < lower and bar.close >= lower:
+            return index
+    return None
+
+
+def _is_confirmed_breakdown(bars: list[MarketBar], channel: _Channel, confirm_bars: int) -> bool:
+    if confirm_bars <= 0 or len(bars) < confirm_bars:
+        return False
+    for offset in range(confirm_bars):
+        idx = len(bars) - 1 - offset
+        lower = channel.support_at(idx)
+        if bars[idx].close >= lower:
+            return False
+    return True
+
+
+def _parent_short_gate_reason(context: dict[str, float | str | None]) -> str | None:
+    parent_event = context.get("parent_event_type")
+    parent_type = context.get("parent_structure_type")
+    position = context.get("parent_position_in_channel")
+
+    if parent_event in {"shock_break_reclaim", "post_shock_stabilization"}:
+        return "shock_override_active"
+    if parent_type == "descending_channel" and position in {"near_lower_boundary", "below_lower_boundary"}:
+        return "parent_context_conflict"
+    if parent_type == "ascending_channel" and position == "near_lower_boundary":
+        return "parent_context_conflict"
+    if parent_type == "ascending_channel" and position == "below_lower_boundary" and parent_event != "confirmed_breakdown":
+        return "parent_context_conflict"
+    return None
 
 
 def _detect_impulse_state(

@@ -94,6 +94,11 @@ class TrendBreakoutConfig:
     adx_threshold: float = 25.0
     adx_mode: str = "simple"  # "simple" or "smart" (bounce/breakout aware)
 
+    # ── Scale-in / trailing exit ───────────────────────────────────
+    scale_in_enabled: bool = False  # allow adding to winning positions
+    scale_in_min_profit_pct: float = 0.02  # min unrealized profit% to allow scale-in
+    use_trailing_exit: bool = False  # skip fixed target, rely on trailing stop
+
     # ── Optional filters (disabled by default) ────────────────────
     ma_regime_filter: bool = False  # +MA200: DD 19.3%->9.6%, WR 50%->61.5%
     ma_regime_period: int = 200
@@ -101,6 +106,10 @@ class TrendBreakoutConfig:
     crowded_short_threshold: float = 0.0
     oi_divergence_lookback: int = 0  # 0=disabled. Bars to check OI-price alignment.
     oi_divergence_threshold: float = -0.03  # OI change% below this = "falling" (e.g., -3%)
+    liq_cascade_filter: bool = False  # require liquidation cascade confirmation
+    liq_cascade_min_usd: float = 1_000_000  # min liquidation USD to count as cascade
+    taker_imbalance_filter: bool = False  # require taker buy/sell imbalance confirmation
+    taker_imbalance_min_ratio: float = 1.10  # buy/sell ratio threshold
     use_parent_boundary_targets: bool = False  # tested: hurts return (-13%)
     use_narrative_regime: bool = False  # legacy: system works without it
 
@@ -175,9 +184,42 @@ class TrendBreakoutStrategy(Strategy):
             )
 
         if position.is_open:
+            exit_signal = self._manage_open_position(position, bars[-1].close)
+            if exit_signal.action != "hold":
+                return StrategyEvaluation(
+                    signal=exit_signal,
+                    rule_evaluations=_all_failed("position_exit"),
+                    parent_context=None,
+                )
+            # Scale-in: if enabled and position is profitable enough, run full pipeline
+            if not self.config.scale_in_enabled:
+                return StrategyEvaluation(
+                    signal=exit_signal,
+                    rule_evaluations=_all_failed("position_open"),
+                    parent_context=None,
+                )
+            current_price = bars[-1].close
+            if position.side == "long":
+                unrealized_pct = (current_price - position.average_price) / position.average_price
+            else:
+                unrealized_pct = (position.average_price - current_price) / position.average_price
+            if unrealized_pct < self.config.scale_in_min_profit_pct:
+                return StrategyEvaluation(
+                    signal=exit_signal,
+                    rule_evaluations=_all_failed("scale_in_not_profitable_enough"),
+                    parent_context=None,
+                )
+            # Structural continuation scale-in: channel still exists + momentum confirmed
+            scale_in_signal = self._check_scale_in_continuation(position, bars)
+            if scale_in_signal is not None:
+                return StrategyEvaluation(
+                    signal=scale_in_signal,
+                    rule_evaluations=_all_failed("scale_in_entry"),
+                    parent_context=None,
+                )
             return StrategyEvaluation(
-                signal=self._manage_open_position(position, bars[-1].close),
-                rule_evaluations=_all_failed("position_open"),
+                signal=exit_signal,
+                rule_evaluations=_all_failed("scale_in_no_continuation"),
                 parent_context=None,
             )
 
@@ -311,6 +353,48 @@ class TrendBreakoutStrategy(Strategy):
                     winning_signal = StrategySignal(
                         action="hold", confidence=0.0, reason="oi_price_divergence_blocked",
                     )
+
+        # Liquidation cascade confirmation filter
+        if (
+            winning_signal.action != "hold"
+            and futures_provider is not None
+            and self.config.liq_cascade_filter
+        ):
+            snap = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
+            if snap is not None:
+                if winning_signal.action == "short":
+                    # Short confirmed by longs getting liquidated
+                    if (snap.liq_long_usd or 0) < self.config.liq_cascade_min_usd:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="liq_cascade_not_confirmed",
+                        )
+                elif winning_signal.action == "buy":
+                    # Long confirmed by shorts getting liquidated
+                    if (snap.liq_short_usd or 0) < self.config.liq_cascade_min_usd:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="liq_cascade_not_confirmed",
+                        )
+
+        # Taker buy/sell imbalance confirmation filter
+        if (
+            winning_signal.action != "hold"
+            and futures_provider is not None
+            and self.config.taker_imbalance_filter
+        ):
+            snap = futures_provider.get_snapshot(symbol, bars[-1].timestamp)
+            if snap is not None:
+                buy_usd = snap.taker_buy_usd or 0
+                sell_usd = snap.taker_sell_usd or 0
+                if winning_signal.action == "buy" and sell_usd > 0:
+                    if buy_usd / sell_usd < self.config.taker_imbalance_min_ratio:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="taker_imbalance_not_confirmed",
+                        )
+                elif winning_signal.action == "short" and buy_usd > 0:
+                    if sell_usd / buy_usd < self.config.taker_imbalance_min_ratio:
+                        winning_signal = StrategySignal(
+                            action="hold", confidence=0.0, reason="taker_imbalance_not_confirmed",
+                        )
 
         # ADX trend strength filter
         if winning_signal.action != "hold" and self.config.adx_filter:
@@ -677,19 +761,92 @@ class TrendBreakoutStrategy(Strategy):
         )
         return _triggered(rule_name), signal
 
-    @staticmethod
-    def _manage_open_position(position: Position, current_price: float) -> StrategySignal:
+    def _check_scale_in_continuation(
+        self,
+        position: Position,
+        bars: list[MarketBar],
+    ) -> StrategySignal | None:
+        """Scale-in if channel structure still aligns with position direction.
+
+        Does NOT require price to be in the entry zone (unlike fresh entries).
+        Instead checks: (1) channel still detected, (2) same direction, (3) momentum ok.
+        Research: Bao et al. (2006) — "Adding to winners" in trend-following.
+        """
+        recent = bars[-self.config.structure_lookback:]
+        channel, channel_failure = _detect_channel(recent, self.config)
+        if channel is None and self.config.secondary_structure_lookback is not None:
+            sec = self.config.secondary_structure_lookback
+            if len(bars) >= sec:
+                channel, channel_failure = _detect_channel(bars[-sec:], self.config)
+        if channel is None:
+            return None
+
+        current_price = bars[-1].close
+        # Check ADX for momentum confirmation (trend should be strengthening)
+        adx_val = _compute_adx(bars, self.config.adx_period) if self.config.adx_filter else None
+
+        if position.side == "long":
+            # Long scale-in: ascending or descending channel that's still bullish
+            is_bullish = channel.kind in ("ascending_channel", "descending_channel")
+            impulse = _detect_impulse_state(
+                recent[-self.config.impulse_lookback:],
+                self.config.impulse_threshold_pct,
+                self.config.impulse_atr_expansion_min,
+                self.config.impulse_volume_expansion_min,
+            )
+            if is_bullish and impulse == "bullish":
+                # ADX check: trend should not be exhausted
+                if adx_val is not None and adx_val < 15:
+                    return None  # trend too weak for scale-in
+                # Use current channel support as new stop
+                idx = len(recent) - 1
+                new_stop = channel.support_at(idx) - (channel.width * self.config.stop_buffer_pct)
+                return StrategySignal(
+                    action="buy",
+                    confidence=0.6,
+                    reason="scale_in_continuation",
+                    stop_price=new_stop,
+                    target_price=channel.resistance_at(idx) + channel.width,
+                    metadata={"scale_in": True},
+                )
+
+        elif position.side == "short":
+            is_bearish = channel.kind in ("ascending_channel", "descending_channel")
+            impulse = _detect_impulse_state(
+                recent[-self.config.impulse_lookback:],
+                self.config.impulse_threshold_pct,
+                self.config.impulse_atr_expansion_min,
+                self.config.impulse_volume_expansion_min,
+            )
+            if is_bearish and impulse == "bearish":
+                if adx_val is not None and adx_val < 15:
+                    return None
+                idx = len(recent) - 1
+                new_stop = channel.resistance_at(idx) + (channel.width * self.config.stop_buffer_pct)
+                return StrategySignal(
+                    action="short",
+                    confidence=0.6,
+                    reason="scale_in_continuation",
+                    stop_price=new_stop,
+                    target_price=channel.support_at(idx) - channel.width,
+                    metadata={"scale_in": True},
+                )
+
+        return None
+
+    def _manage_open_position(self, position: Position, current_price: float) -> StrategySignal:
         stop_price = getattr(position, "stop_price", None)
         target_price = getattr(position, "target_price", None)
+        use_trailing = self.config.use_trailing_exit
         if position.side == "long":
             if stop_price is not None and current_price <= stop_price:
                 return StrategySignal(action="sell", confidence=1.0, reason="long_structure_stop")
-            if target_price is not None and current_price >= target_price:
+            if not use_trailing and target_price is not None and current_price >= target_price:
                 return StrategySignal(action="sell", confidence=1.0, reason="long_target_hit")
         if position.side == "short":
             if stop_price is not None and current_price >= stop_price:
                 return StrategySignal(action="cover", confidence=1.0, reason="short_structure_stop")
-            if target_price is not None and current_price <= target_price:
+            if not use_trailing and target_price is not None and current_price <= target_price:
                 return StrategySignal(action="cover", confidence=1.0, reason="short_target_hit")
         return StrategySignal(action="hold", confidence=0.0, reason="position_open")
 

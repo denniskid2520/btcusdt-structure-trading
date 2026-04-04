@@ -49,10 +49,6 @@ class FuturesDataProvider(ABC):
 class StaticFuturesProvider(FuturesDataProvider):
     """In-memory provider for backtesting — preloaded with historical data."""
 
-    def __init__(self, data: dict[datetime, FuturesSnapshot]) -> None:
-        self._data = data
-        self._sorted_ts = sorted(data.keys())
-
     def __init__(self, data: dict[datetime, FuturesSnapshot], tolerance_hours: int = 4) -> None:
         self._data = data
         self._sorted_ts = sorted(data.keys())

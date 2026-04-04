@@ -1381,3 +1381,273 @@ def test_oi_divergence_skipped_when_disabled() -> None:
 ## Backtest result: crypto funding rate has persistent positive bias (mean 0.9%/day),
 ## absolute thresholds block too many normal trades, Z-score variance too high.
 ## See PMC (2023): crypto indicators need special adaptation from equity models.
+
+
+# ── Phase 1: Scale-in + Trailing Stop Tests ─────────────────────────────
+
+
+def test_scale_in_generates_buy_when_long_position_profitable() -> None:
+    """When position is open, profitable, and a new buy signal fires → scale-in buy."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            scale_in_enabled=True,
+            scale_in_min_profit_pct=0.01,  # 1% profit needed
+        )
+    )
+
+    # Position is long, entry at price below current (profitable)
+    current_price = channel_bars[-1].close
+    entry_price = current_price * 0.95  # 5% below → profitable
+    position = Position(
+        symbol="BTCUSDT", side="long", quantity=0.1,
+        average_price=entry_price, reserved_margin=1000.0,
+    )
+
+    result = strategy.evaluate(symbol="BTCUSDT", bars=channel_bars, position=position)
+    # Should generate a buy (scale-in), not hold
+    assert result.signal.action == "buy", f"Expected buy for scale-in, got {result.signal.action} ({result.signal.reason})"
+
+
+def test_scale_in_blocked_when_position_not_profitable_enough() -> None:
+    """Scale-in should not fire when position is not yet profitable enough."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            scale_in_enabled=True,
+            scale_in_min_profit_pct=0.10,  # 10% profit needed (high bar)
+        )
+    )
+
+    # Position barely profitable (1%)
+    current_price = channel_bars[-1].close
+    entry_price = current_price * 0.99
+    position = Position(
+        symbol="BTCUSDT", side="long", quantity=0.1,
+        average_price=entry_price, reserved_margin=1000.0,
+    )
+
+    result = strategy.evaluate(symbol="BTCUSDT", bars=channel_bars, position=position)
+    assert result.signal.action == "hold", f"Expected hold (not enough profit), got {result.signal.action}"
+
+
+def test_scale_in_disabled_returns_hold_for_open_position() -> None:
+    """When scale_in_enabled=False, open position always returns hold (or stop/target)."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            scale_in_enabled=False,  # disabled
+        )
+    )
+
+    current_price = channel_bars[-1].close
+    entry_price = current_price * 0.90  # very profitable
+    position = Position(
+        symbol="BTCUSDT", side="long", quantity=0.1,
+        average_price=entry_price, reserved_margin=1000.0,
+    )
+
+    result = strategy.evaluate(symbol="BTCUSDT", bars=channel_bars, position=position)
+    assert result.signal.action == "hold"
+
+
+def test_trailing_exit_skips_target_check() -> None:
+    """When use_trailing_exit=True, hitting target_price should NOT trigger exit."""
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(use_trailing_exit=True)
+    )
+
+    # Long position where current price is above target
+    position = Position(
+        symbol="BTCUSDT", side="long", quantity=0.1,
+        average_price=100.0, reserved_margin=1000.0,
+    )
+    # Mock PaperPosition with stop and target
+    position.stop_price = 90.0
+    position.target_price = 110.0
+
+    signal = strategy._manage_open_position(position, current_price=115.0)
+    # Should NOT sell at target — trailing stop handles exit
+    assert signal.action == "hold", f"Expected hold (trailing mode), got {signal.action}"
+
+
+def test_trailing_exit_still_respects_stop() -> None:
+    """Trailing mode should still honor the structure stop."""
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(use_trailing_exit=True)
+    )
+
+    position = Position(
+        symbol="BTCUSDT", side="long", quantity=0.1,
+        average_price=100.0, reserved_margin=1000.0,
+    )
+    position.stop_price = 90.0
+    position.target_price = 110.0
+
+    signal = strategy._manage_open_position(position, current_price=85.0)
+    # Should sell — stop is still honored
+    assert signal.action == "sell"
+
+
+# ── Phase 2: Liquidation / Taker Volume Filter Tests ────────────────────
+
+
+def _make_provider_with_liq_taker(bars, liq_long=0.0, liq_short=0.0, buy_usd=0.0, sell_usd=0.0):
+    """Helper: provider with liquidation + taker data at the current bar timestamp."""
+    ts = bars[-1].timestamp
+    snap = FuturesSnapshot(
+        timestamp=ts,
+        open_interest=1e9,
+        long_short_ratio=1.0,
+        taker_buy_sell_ratio=1.0,
+        oi_close=1e9,
+        liq_long_usd=liq_long,
+        liq_short_usd=liq_short,
+        taker_buy_usd=buy_usd,
+        taker_sell_usd=sell_usd,
+    )
+    return StaticFuturesProvider({ts: snap})
+
+
+def test_liq_cascade_confirms_short_when_longs_liquidated() -> None:
+    """Short signal + large long liquidations = confirmed (pass through)."""
+    channel_bars = descending_channel_rejection_short_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.004,
+            entry_buffer_pct=0.25,
+            stop_buffer_pct=0.08,
+            allow_longs=False,
+            require_parent_confirmation=False,
+            liq_cascade_filter=True,
+            liq_cascade_min_usd=500_000,
+        )
+    )
+
+    provider = _make_provider_with_liq_taker(
+        channel_bars, liq_long=1_000_000, liq_short=100_000,
+    )
+
+    result = strategy.evaluate(
+        symbol="BTCUSDT", bars=channel_bars,
+        position=Position(symbol="BTCUSDT"),
+        futures_provider=provider,
+    )
+    assert result.signal.action == "short"
+
+
+def test_liq_cascade_blocks_short_when_no_long_liquidation() -> None:
+    """Short signal without enough long liquidation = blocked."""
+    channel_bars = descending_channel_rejection_short_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.004,
+            entry_buffer_pct=0.25,
+            stop_buffer_pct=0.08,
+            allow_longs=False,
+            require_parent_confirmation=False,
+            liq_cascade_filter=True,
+            liq_cascade_min_usd=500_000,
+        )
+    )
+
+    provider = _make_provider_with_liq_taker(
+        channel_bars, liq_long=100_000, liq_short=100_000,  # not enough
+    )
+
+    result = strategy.evaluate(
+        symbol="BTCUSDT", bars=channel_bars,
+        position=Position(symbol="BTCUSDT"),
+        futures_provider=provider,
+    )
+    assert result.signal.reason == "liq_cascade_not_confirmed"
+
+
+def test_taker_imbalance_confirms_long_when_buy_dominant() -> None:
+    """Long signal + taker buy dominance = confirmed."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            taker_imbalance_filter=True,
+            taker_imbalance_min_ratio=1.1,
+        )
+    )
+
+    provider = _make_provider_with_liq_taker(
+        channel_bars, buy_usd=2_000_000, sell_usd=1_500_000,  # ratio 1.33 > 1.1
+    )
+
+    result = strategy.evaluate(
+        symbol="BTCUSDT", bars=channel_bars,
+        position=Position(symbol="BTCUSDT"),
+        futures_provider=provider,
+    )
+    assert result.signal.action == "buy"
+
+
+def test_taker_imbalance_blocks_long_when_sell_dominant() -> None:
+    """Long signal + sell-dominant taker = blocked."""
+    channel_bars = ascending_channel_support_long_bars()
+
+    strategy = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            taker_imbalance_filter=True,
+            taker_imbalance_min_ratio=1.1,
+        )
+    )
+
+    provider = _make_provider_with_liq_taker(
+        channel_bars, buy_usd=1_000_000, sell_usd=2_000_000,  # buy/sell = 0.5 < 1.1
+    )
+
+    result = strategy.evaluate(
+        symbol="BTCUSDT", bars=channel_bars,
+        position=Position(symbol="BTCUSDT"),
+        futures_provider=provider,
+    )
+    assert result.signal.reason == "taker_imbalance_not_confirmed"

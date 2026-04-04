@@ -692,22 +692,55 @@ def _build_parent_context(
     config: TrendBreakoutConfig,
 ) -> dict[str, float | str | None]:
     parent_bars = _resample_bars_for_parent(bars, config.parent_timeframe_factor)
-    lookback = min(config.parent_structure_lookback, len(parent_bars))
-    if lookback < max(config.parent_pivot_window * 2 + 1, config.parent_min_pivot_highs + config.parent_min_pivot_lows):
-        return _empty_parent_context()
-    window = parent_bars[-lookback:]
-    parent_channel, failure = _detect_channel(
-        window,
-        TrendBreakoutConfig(
-            pivot_window=config.parent_pivot_window,
-            min_pivot_highs=config.parent_min_pivot_highs,
-            min_pivot_lows=config.parent_min_pivot_lows,
-            max_slope_divergence_ratio=config.max_slope_divergence_ratio,
-            min_channel_width_abs=config.min_channel_width_abs,
-            min_channel_width_pct=config.min_channel_width_pct,
-        ),
+    min_bars = max(config.parent_pivot_window * 2 + 1, config.parent_min_pivot_highs + config.parent_min_pivot_lows)
+
+    # Multi-scale detection: try multiple lookback windows, pick best channel.
+    # Shorter windows capture recent structure; longer windows capture macro trends.
+    max_lookback = min(config.parent_structure_lookback, len(parent_bars))
+    lookback_candidates = [lb for lb in [60, 90, 120, 180, 240, 360] if min_bars <= lb <= max_lookback]
+    if not lookback_candidates:
+        lookback_candidates = [max_lookback] if max_lookback >= min_bars else []
+
+    detect_cfg = TrendBreakoutConfig(
+        pivot_window=config.parent_pivot_window,
+        min_pivot_highs=config.parent_min_pivot_highs,
+        min_pivot_lows=config.parent_min_pivot_lows,
+        max_slope_divergence_ratio=config.max_slope_divergence_ratio,
+        min_channel_width_abs=config.min_channel_width_abs,
+        min_channel_width_pct=config.min_channel_width_pct,
     )
-    if failure != "ok" or parent_channel is None:
+
+    best_channel: _Channel | None = None
+    best_window: list[MarketBar] = []
+    best_score = -1.0
+
+    for lookback in lookback_candidates:
+        window = parent_bars[-lookback:]
+        channel, failure = _detect_channel(window, detect_cfg)
+        if failure != "ok" or channel is None:
+            continue
+        # Score: prefer channels with more pivot touches and better fit
+        last_idx = len(window) - 1
+        width = max(channel.resistance_at(last_idx) - channel.support_at(last_idx), 1e-9)
+        pivots = _find_pivots(window, config.parent_pivot_window)
+        tolerance = width * 0.12
+        touches = 0
+        for p in pivots:
+            if p.kind == "high":
+                fitted = channel.resistance_slope * p.index + channel.resistance_intercept
+            else:
+                fitted = channel.support_slope * p.index + channel.support_intercept
+            if abs(p.price - fitted) <= tolerance:
+                touches += 1
+        score = touches
+        if score > best_score:
+            best_score = score
+            best_channel = channel
+            best_window = window
+
+    parent_channel = best_channel
+    window = best_window
+    if parent_channel is None:
         return _empty_parent_context()
 
     last_index = len(window) - 1

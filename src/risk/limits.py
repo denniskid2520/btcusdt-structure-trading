@@ -11,6 +11,8 @@ class RiskLimits:
     risk_per_trade_pct: float = 0.02
     max_open_positions: int = 1
     leverage: int = 1
+    scale_in_max_adds: int = 0  # 0 = no scale-in, >0 = max additional entries
+    scale_in_position_pct: float = 0.03  # margin % per scale-in add
 
 
 def calculate_order_quantity(
@@ -50,7 +52,17 @@ def allow_order(
     limits: RiskLimits,
     existing_position: Position,
 ) -> bool:
+    is_scale_in = order.metadata.get("scale_in", False)
     if order.side in {"buy", "short"}:
+        if is_scale_in:
+            # Scale-in: allow if same direction and margin fits
+            same_dir = (order.side == "buy" and existing_position.side == "long") or \
+                       (order.side == "short" and existing_position.side == "short")
+            if not same_dir:
+                return False
+            leverage = max(limits.leverage, 1)
+            margin = (order.quantity * market_price) / leverage
+            return margin <= (cash * limits.scale_in_position_pct * (cash + existing_position.reserved_margin))
         if open_positions >= limits.max_open_positions or existing_position.is_open:
             return False
         leverage = max(limits.leverage, 1)

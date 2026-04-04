@@ -190,20 +190,45 @@ def run_backtest(
                 stop_dist = 0.0
                 if signal.stop_price and signal.stop_price > 0:
                     stop_dist = abs(current_bar.close - signal.stop_price) / current_bar.close
-                quantity = calculate_order_quantity(
-                    cash=broker.get_cash(),
-                    market_price=current_bar.close,
-                    limits=limits,
-                    stop_distance_pct=stop_dist,
-                )
-                entry_metadata = {
-                    "reason": signal.reason,
-                    "stop_price": signal.stop_price,
-                    "target_price": signal.target_price,
-                    "second_target_price": signal.metadata.get("second_target_price") if signal.metadata else None,
-                }
-                if signal.metadata and signal.metadata.get("trailing_stop_atr"):
-                    entry_metadata["trailing_stop_atr"] = signal.metadata["trailing_stop_atr"]
+
+                # Check if this is a scale-in opportunity
+                is_scale_in = False
+                if position.is_open and limits.scale_in_max_adds > 0:
+                    same_dir = (signal.action == "buy" and position.side == "long") or \
+                               (signal.action == "short" and position.side == "short")
+                    adds_so_far = open_entries.get(symbol, {}).get("scale_in_count", 0)
+                    if same_dir and adds_so_far < limits.scale_in_max_adds:
+                        is_scale_in = True
+
+                if is_scale_in:
+                    # Scale-in: use scale_in_position_pct for sizing
+                    scale_in_limits = RiskLimits(
+                        max_position_pct=limits.scale_in_position_pct,
+                        risk_per_trade_pct=limits.risk_per_trade_pct,
+                        leverage=limits.leverage,
+                    )
+                    quantity = calculate_order_quantity(
+                        cash=broker.get_cash(),
+                        market_price=current_bar.close,
+                        limits=scale_in_limits,
+                        stop_distance_pct=stop_dist,
+                    )
+                    entry_metadata = {"scale_in": True, "reason": signal.reason}
+                else:
+                    quantity = calculate_order_quantity(
+                        cash=broker.get_cash(),
+                        market_price=current_bar.close,
+                        limits=limits,
+                        stop_distance_pct=stop_dist,
+                    )
+                    entry_metadata = {
+                        "reason": signal.reason,
+                        "stop_price": signal.stop_price,
+                        "target_price": signal.target_price,
+                        "second_target_price": signal.metadata.get("second_target_price") if signal.metadata else None,
+                    }
+                    if signal.metadata and signal.metadata.get("trailing_stop_atr"):
+                        entry_metadata["trailing_stop_atr"] = signal.metadata["trailing_stop_atr"]
                 order = OrderRequest(
                     symbol=symbol,
                     side=signal.action,
@@ -232,17 +257,22 @@ def run_backtest(
             if fill is not None:
                 fills.append(fill)
                 if fill.side in {"buy", "short"}:
-                    open_entries[fill.symbol] = {
-                        "symbol": fill.symbol,
-                        "entry_rule": order.metadata.get("reason", ""),
-                        "side": fill.side,
-                        "entry_time": fill.timestamp,
-                        "entry_price": fill.fill_price,
-                        "entry_fee": fill.fee,
-                        "entry_index": index,
-                        "trailing_stop_atr": order.metadata.get("trailing_stop_atr", 0),
-                        "best_price": fill.fill_price,
-                    }
+                    if order.metadata.get("scale_in") and fill.symbol in open_entries:
+                        # Scale-in: increment counter, keep original entry info
+                        open_entries[fill.symbol]["scale_in_count"] = open_entries[fill.symbol].get("scale_in_count", 0) + 1
+                    else:
+                        open_entries[fill.symbol] = {
+                            "symbol": fill.symbol,
+                            "entry_rule": order.metadata.get("reason", ""),
+                            "side": fill.side,
+                            "entry_time": fill.timestamp,
+                            "entry_price": fill.fill_price,
+                            "entry_fee": fill.fee,
+                            "entry_index": index,
+                            "trailing_stop_atr": order.metadata.get("trailing_stop_atr", 0),
+                            "best_price": fill.fill_price,
+                            "scale_in_count": 0,
+                        }
                 elif fill.side in {"sell", "cover"} and fill.symbol in open_entries:
                     entry = open_entries.pop(fill.symbol)
                     trades.append(

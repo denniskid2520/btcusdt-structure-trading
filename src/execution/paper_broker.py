@@ -52,39 +52,66 @@ class PaperBroker(BrokerAdapter):
         notional = fill_price * filled_quantity
         margin = notional / self.leverage
         fee = notional * self.fee_rate
-        if order.side in {"buy", "short"} and position.is_open:
-            raise ValueError("PaperBroker supports one open position per symbol.")
+        is_scale_in = order.metadata.get("scale_in", False)
+
+        if order.side in {"buy", "short"} and position.is_open and not is_scale_in:
+            # Scale-in: allow adding to same-direction positions
+            if (order.side == "buy" and position.side == "long") or (
+                order.side == "short" and position.side == "short"
+            ):
+                is_scale_in = True
+            else:
+                raise ValueError("PaperBroker: cannot open opposite position while one is open.")
 
         if order.side == "buy":
             if margin + fee > self._cash:
                 return None
             self._cash -= margin + fee
-            self._positions[order.symbol] = PaperPosition(
-                symbol=order.symbol,
-                side="long",
-                quantity=filled_quantity,
-                average_price=fill_price,
-                reserved_margin=margin,
-                stop_price=order.metadata.get("stop_price"),
-                target_price=order.metadata.get("target_price"),
-                second_target_price=order.metadata.get("second_target_price"),
-                entry_reason=order.metadata.get("reason", ""),
-            )
+            if is_scale_in and position.is_open and position.side == "long":
+                # Scale-in: weighted average price, add quantity and margin
+                new_qty = position.quantity + filled_quantity
+                new_avg = (position.average_price * position.quantity + fill_price * filled_quantity) / new_qty
+                new_margin = position.reserved_margin + margin
+                self._positions[order.symbol] = PaperPosition(
+                    symbol=order.symbol, side="long", quantity=new_qty,
+                    average_price=new_avg, reserved_margin=new_margin,
+                    stop_price=position.stop_price, target_price=position.target_price,
+                    second_target_price=position.second_target_price,
+                    entry_reason=position.entry_reason,
+                )
+            else:
+                self._positions[order.symbol] = PaperPosition(
+                    symbol=order.symbol, side="long", quantity=filled_quantity,
+                    average_price=fill_price, reserved_margin=margin,
+                    stop_price=order.metadata.get("stop_price"),
+                    target_price=order.metadata.get("target_price"),
+                    second_target_price=order.metadata.get("second_target_price"),
+                    entry_reason=order.metadata.get("reason", ""),
+                )
         elif order.side == "short":
             if margin + fee > self._cash:
                 return None
             self._cash -= margin + fee
-            self._positions[order.symbol] = PaperPosition(
-                symbol=order.symbol,
-                side="short",
-                quantity=filled_quantity,
-                average_price=fill_price,
-                reserved_margin=margin,
-                stop_price=order.metadata.get("stop_price"),
-                target_price=order.metadata.get("target_price"),
-                second_target_price=order.metadata.get("second_target_price"),
-                entry_reason=order.metadata.get("reason", ""),
-            )
+            if is_scale_in and position.is_open and position.side == "short":
+                new_qty = position.quantity + filled_quantity
+                new_avg = (position.average_price * position.quantity + fill_price * filled_quantity) / new_qty
+                new_margin = position.reserved_margin + margin
+                self._positions[order.symbol] = PaperPosition(
+                    symbol=order.symbol, side="short", quantity=new_qty,
+                    average_price=new_avg, reserved_margin=new_margin,
+                    stop_price=position.stop_price, target_price=position.target_price,
+                    second_target_price=position.second_target_price,
+                    entry_reason=position.entry_reason,
+                )
+            else:
+                self._positions[order.symbol] = PaperPosition(
+                    symbol=order.symbol, side="short", quantity=filled_quantity,
+                    average_price=fill_price, reserved_margin=margin,
+                    stop_price=order.metadata.get("stop_price"),
+                    target_price=order.metadata.get("target_price"),
+                    second_target_price=order.metadata.get("second_target_price"),
+                    entry_reason=order.metadata.get("reason", ""),
+                )
         elif order.side in {"sell", "cover"}:
             if not position.is_open:
                 return None
@@ -103,7 +130,7 @@ class PaperBroker(BrokerAdapter):
             self._cash += released_margin + pnl - fee
             remaining_quantity = position.quantity - exit_quantity
             remaining_margin = position.reserved_margin - released_margin
-            if remaining_quantity <= 0:
+            if remaining_quantity <= 1e-12:
                 self._positions.pop(order.symbol, None)
             else:
                 self._positions[order.symbol] = PaperPosition(

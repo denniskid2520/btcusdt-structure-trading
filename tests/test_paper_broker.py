@@ -138,3 +138,86 @@ def test_leverage_default_is_1x() -> None:
     # 1x leverage: margin = full notional = 10,000
     assert broker.get_cash() == 0.0
     assert broker.get_position("BTCUSDT").reserved_margin == 10_000.0
+
+
+# ── Scale-in (加倉) Tests ──────────────────────────────────────────────
+
+
+def test_scale_in_adds_to_existing_long_position() -> None:
+    """Scale-in: buying more when already long should increase quantity and average price."""
+    broker = PaperBroker(initial_cash=10_000.0, fee_rate=0.0, slippage_rate=0.0, leverage=3)
+    ts = datetime(2025, 1, 1)
+
+    # Initial entry: buy 0.1 BTC at $60k → margin = $2,000
+    broker.submit_order(
+        OrderRequest(symbol="BTCUSDT", side="buy", quantity=0.1, timestamp=ts),
+        market_price=60_000.0,
+    )
+    pos = broker.get_position("BTCUSDT")
+    assert pos.quantity == 0.1
+    assert pos.average_price == 60_000.0
+    assert broker.get_cash() == 8_000.0  # 10k - 2k margin
+
+    # Scale-in: buy 0.05 more at $62k → margin += $1,033.33
+    fill = broker.submit_order(
+        OrderRequest(symbol="BTCUSDT", side="buy", quantity=0.05, timestamp=ts,
+                     metadata={"scale_in": True}),
+        market_price=62_000.0,
+    )
+    assert fill is not None
+    pos = broker.get_position("BTCUSDT")
+    assert abs(pos.quantity - 0.15) < 1e-9  # 0.1 + 0.05
+    # Weighted avg: (0.1 * 60000 + 0.05 * 62000) / 0.15 = 60666.67
+    assert abs(pos.average_price - 60_666.67) < 1.0
+    # Margin: 2000 + (0.05 * 62000 / 3) = 2000 + 1033.33 = 3033.33
+    assert abs(pos.reserved_margin - 3_033.33) < 1.0
+
+
+def test_scale_in_adds_to_existing_short_position() -> None:
+    """Scale-in: shorting more when already short should increase quantity."""
+    broker = PaperBroker(initial_cash=10_000.0, fee_rate=0.0, slippage_rate=0.0, leverage=5)
+    ts = datetime(2025, 1, 1)
+
+    # Initial short: 0.1 BTC at $60k → margin = $1,200
+    broker.submit_order(
+        OrderRequest(symbol="BTCUSDT", side="short", quantity=0.1, timestamp=ts),
+        market_price=60_000.0,
+    )
+    assert broker.get_cash() == 8_800.0
+
+    # Scale-in short: 0.05 more at $58k → margin += $580
+    fill = broker.submit_order(
+        OrderRequest(symbol="BTCUSDT", side="short", quantity=0.05, timestamp=ts,
+                     metadata={"scale_in": True}),
+        market_price=58_000.0,
+    )
+    assert fill is not None
+    pos = broker.get_position("BTCUSDT")
+    assert abs(pos.quantity - 0.15) < 1e-9
+    # Weighted avg: (0.1 * 60000 + 0.05 * 58000) / 0.15 = 59333.33
+    assert abs(pos.average_price - 59_333.33) < 1.0
+
+
+def test_scale_in_full_exit_returns_correct_pnl() -> None:
+    """After scale-in, closing the full position should compute PnL on weighted avg price."""
+    broker = PaperBroker(initial_cash=10_000.0, fee_rate=0.0, slippage_rate=0.0, leverage=3)
+    ts = datetime(2025, 1, 1)
+
+    # Entry at $60k, scale-in at $62k
+    broker.submit_order(
+        OrderRequest(symbol="BTCUSDT", side="buy", quantity=0.1, timestamp=ts),
+        market_price=60_000.0,
+    )
+    broker.submit_order(
+        OrderRequest(symbol="BTCUSDT", side="buy", quantity=0.05, timestamp=ts,
+                     metadata={"scale_in": True}),
+        market_price=62_000.0,
+    )
+    # Close at $65k: PnL = 0.15 * (65000 - 60666.67) = $650
+    broker.submit_order(
+        OrderRequest(symbol="BTCUSDT", side="sell", quantity=0.15, timestamp=ts),
+        market_price=65_000.0,
+    )
+    assert broker.get_position("BTCUSDT").side == "flat"
+    # Cash = 10000 - 2000 (margin1) - 1033.33 (margin2) + 3033.33 (margin back) + 650 (pnl) = 10650
+    assert abs(broker.get_cash() - 10_650.0) < 1.0

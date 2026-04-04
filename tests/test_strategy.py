@@ -932,3 +932,53 @@ def test_oi_filter_blocks_short_when_crowd_is_short() -> None:
         futures_provider=provider,
     )
     assert result_oi.signal.action == "hold", "OI filter should block short when crowd is 71% short"
+
+
+def test_adx_filter_blocks_trade_in_weak_trend() -> None:
+    """When ADX is below threshold, trades should be blocked (no clear trend)."""
+    from tests.fixtures_synthetic_bars import make_bar
+
+    # Build 30 bars of choppy sideways (low ADX): price oscillates ±0.1%
+    choppy_bars = []
+    base = 60_000.0
+    for i in range(30):
+        p = base + (50 if i % 2 == 0 else -50)
+        choppy_bars.append(make_bar(i, p, high_pad=60, low_pad=60))
+
+    # Append the ascending channel fixture at end
+    channel_bars = ascending_channel_support_long_bars()
+    # Use choppy prefix + channel bars
+    all_bars = choppy_bars + channel_bars
+
+    # Without ADX filter: should buy
+    no_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+        )
+    )
+    result_no = no_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
+    assert result_no.signal.action == "buy", "Without ADX filter, buy should trigger"
+
+    # With ADX filter (threshold=25): choppy market → ADX low → blocked
+    with_filter = TrendBreakoutStrategy(
+        TrendBreakoutConfig(
+            impulse_lookback=12,
+            structure_lookback=24,
+            impulse_threshold_pct=0.03,
+            entry_buffer_pct=0.35,
+            stop_buffer_pct=0.08,
+            allow_shorts=False,
+            require_parent_confirmation=False,
+            adx_filter=True,
+            adx_period=14,
+            adx_threshold=25.0,
+        )
+    )
+    result_adx = with_filter.evaluate(symbol="BTCUSDT", bars=all_bars, position=Position(symbol="BTCUSDT"))
+    assert result_adx.signal.action == "hold", "ADX filter should block in weak trend"

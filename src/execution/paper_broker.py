@@ -22,12 +22,14 @@ class PaperBroker(BrokerAdapter):
         slippage_rate: float = 0.0005,
         fill_ratio: float = 1.0,
         leverage: int = 1,
+        margin_mode: str = "isolated",
     ) -> None:
         self._cash = initial_cash
         self.fee_rate = fee_rate
         self.slippage_rate = slippage_rate
         self.fill_ratio = fill_ratio
         self.leverage = max(leverage, 1)
+        self.margin_mode = margin_mode  # "isolated" or "cross"
         self._positions: dict[str, PaperPosition] = {}
         self._order_ids = count(1)
 

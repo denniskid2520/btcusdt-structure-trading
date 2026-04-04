@@ -69,6 +69,9 @@ class TrendBreakoutConfig:
     ma_regime_period: int = 200
     crowded_long_threshold: float = 0.0
     crowded_short_threshold: float = 0.0
+    adx_filter: bool = False
+    adx_period: int = 14
+    adx_threshold: float = 25.0
 
 
 @dataclass(frozen=True)
@@ -241,6 +244,14 @@ class TrendBreakoutStrategy(Strategy):
                         winning_signal = StrategySignal(
                             action="hold", confidence=0.0, reason="oi_crowded_short_blocked",
                         )
+
+        # ADX trend strength filter: block trades when trend is weak
+        if winning_signal.action != "hold" and self.config.adx_filter:
+            adx_val = _compute_adx(bars, self.config.adx_period)
+            if adx_val is not None and adx_val < self.config.adx_threshold:
+                winning_signal = StrategySignal(
+                    action="hold", confidence=0.0, reason="adx_weak_trend_blocked",
+                )
 
         if winning_signal.action != "hold" and self.config.use_parent_boundary_targets:
             winning_signal = _extend_target_to_parent_boundary(winning_signal, parent_context)
@@ -982,6 +993,69 @@ def _compute_atr(bars: list[MarketBar], lookback: int) -> float:
         true_ranges.append(max(bar.high - bar.low, abs(bar.high - prev_close), abs(bar.low - prev_close)))
         prev_close = bar.close
     return mean(true_ranges) if true_ranges else 0.0
+
+
+def _compute_adx(bars: list[MarketBar], period: int) -> float | None:
+    """Average Directional Index — measures trend strength regardless of direction.
+
+    Returns value 0-100.  ADX > 25 → trending, ADX < 20 → ranging.
+    Requires at least ``2 * period`` bars.
+    """
+    needed = 2 * period + 1
+    if len(bars) < needed:
+        return None
+
+    window = bars[-needed:]
+
+    # Step 1: compute +DM, -DM, TR for each bar
+    plus_dm: list[float] = []
+    minus_dm: list[float] = []
+    tr_list: list[float] = []
+    for i in range(1, len(window)):
+        high_diff = window[i].high - window[i - 1].high
+        low_diff = window[i - 1].low - window[i].low
+        pdm = high_diff if high_diff > low_diff and high_diff > 0 else 0.0
+        mdm = low_diff if low_diff > high_diff and low_diff > 0 else 0.0
+        plus_dm.append(pdm)
+        minus_dm.append(mdm)
+        tr = max(
+            window[i].high - window[i].low,
+            abs(window[i].high - window[i - 1].close),
+            abs(window[i].low - window[i - 1].close),
+        )
+        tr_list.append(tr)
+
+    # Step 2: Wilder's smoothing for ATR, +DM, -DM
+    atr_smooth = sum(tr_list[:period])
+    pdm_smooth = sum(plus_dm[:period])
+    mdm_smooth = sum(minus_dm[:period])
+
+    dx_values: list[float] = []
+    for i in range(period, len(tr_list)):
+        atr_smooth = atr_smooth - atr_smooth / period + tr_list[i]
+        pdm_smooth = pdm_smooth - pdm_smooth / period + plus_dm[i]
+        mdm_smooth = mdm_smooth - mdm_smooth / period + minus_dm[i]
+
+        if atr_smooth == 0:
+            continue
+        plus_di = 100 * pdm_smooth / atr_smooth
+        minus_di = 100 * mdm_smooth / atr_smooth
+        di_sum = plus_di + minus_di
+        if di_sum == 0:
+            continue
+        dx_values.append(100 * abs(plus_di - minus_di) / di_sum)
+
+    if not dx_values:
+        return None
+
+    # Step 3: Smooth DX into ADX (first ADX = mean of first period DX values)
+    if len(dx_values) < period:
+        return mean(dx_values)
+
+    adx = mean(dx_values[:period])
+    for dx in dx_values[period:]:
+        adx = (adx * (period - 1) + dx) / period
+    return adx
 
 
 def _extend_target_to_parent_boundary(

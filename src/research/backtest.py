@@ -179,6 +179,8 @@ def run_backtest(
     _native_1d_ts = [b.timestamp for b in _native_1d] if _native_1d else []
     _native_1w_ts = [b.timestamp for b in _native_1w] if _native_1w else []
     _accel_zone = False  # persists between bars; updated every 6th bar
+    _weekly_regime: str | None = None  # "bull" (hist>0) or "bear" (hist<=0), updated every 6 bars
+    _accel_conditions = False  # W-hist<=0 + D-MACD<0, independent of position (for entry gating)
 
     for index in range(1, len(bars)):
         history = bars[: index + 1]
@@ -220,6 +222,32 @@ def run_backtest(
                 if _loss_cooldown_count > 0 and consecutive_losses >= _loss_cooldown_count:
                     cooldown_until = index + _loss_cooldown_bars
                 position = broker.get_position(symbol)
+
+        # ── Weekly MACD regime / ACCEL conditions (independent of position) ──
+        _regime_filter = getattr(_cfg, "weekly_regime_filter", False)
+        _accel_entry_only = getattr(_cfg, "accel_entry_only", False)
+        _accel_entry_block = getattr(_cfg, "accel_entry_block", False)
+        if (_regime_filter or _accel_entry_only or _accel_entry_block) and index % 6 == 0 and len(bars[: index + 1]) > 240:
+            if _native_1w is not None:
+                _wr_wi = bisect_right(_native_1w_ts, current_bar.timestamp)
+                _wr_w_bars = _native_1w[:_wr_wi]
+            else:
+                _wr_w_bars = aggregate_to_weekly(bars[: index + 1])
+            _, _, _wr_w_hist = compute_macd(_wr_w_bars)
+            if _wr_w_hist is not None:
+                _weekly_regime = "bull" if _wr_w_hist > 0 else "bear"
+            # ACCEL conditions: W-hist<=0 + D-MACD<0 (for entry gating/blocking)
+            if _accel_entry_only or _accel_entry_block:
+                if _native_1d is not None:
+                    _ae_di = bisect_right(_native_1d_ts, current_bar.timestamp)
+                    _ae_d_bars = _native_1d[:_ae_di]
+                else:
+                    _ae_d_bars = aggregate_to_daily(bars[: index + 1])
+                _ae_d_macd, _, _ = compute_macd(_ae_d_bars)
+                _accel_conditions = (
+                    _wr_w_hist is not None and _wr_w_hist <= 0
+                    and _ae_d_macd is not None and _ae_d_macd < 0
+                )
 
         # Trailing stop: update best price and check stop
         # ACCEL zone: weekly MACD death cross + daily MACD < 0 → widen trail 3x
@@ -298,6 +326,31 @@ def run_backtest(
                     quantity=position.quantity,
                     timestamp=current_bar.timestamp,
                     metadata={"reason": "time_stop"},
+                )
+
+        # ── Weekly MACD golden cross exit: close ALL shorts when W-hist > 0 ──
+        # 週線金叉 = 趨勢反轉 → 空單止盈
+        _golden_cross_exit = getattr(_cfg, "weekly_macd_golden_cross_exit", False)
+        if (
+            order is None
+            and position.is_open
+            and symbol in open_entries
+            and open_entries[symbol]["side"] == "short"
+            and _golden_cross_exit
+            and index % 6 == 0
+            and len(bars[: index + 1]) > 240
+        ):
+            if _native_1w is not None:
+                _gc_wi = bisect_right(_native_1w_ts, current_bar.timestamp)
+                _gc_w_bars = _native_1w[:_gc_wi]
+            else:
+                _gc_w_bars = aggregate_to_weekly(bars[: index + 1])
+            _, _, _gc_w_hist = compute_macd(_gc_w_bars)
+            if _gc_w_hist is not None and _gc_w_hist > 0:
+                order = OrderRequest(
+                    symbol=symbol, side="cover", quantity=position.quantity,
+                    timestamp=current_bar.timestamp,
+                    metadata={"reason": "weekly_golden_cross_exit"},
                 )
 
         # ── Consecutive loss cooldown: skip entries when on tilt ──
@@ -468,6 +521,37 @@ def run_backtest(
                     action="hold", confidence=0,
                     reason="accel_zone_long_blocked",
                 )
+
+            # ── Weekly regime filter: big-picture trend direction gate ──
+            if _weekly_regime == "bull" and signal.action == "short":
+                signal = StrategySignal(
+                    action="hold", confidence=0,
+                    reason="weekly_regime_bull_short_blocked",
+                )
+            elif _weekly_regime == "bear" and signal.action == "buy":
+                signal = StrategySignal(
+                    action="hold", confidence=0,
+                    reason="weekly_regime_bear_long_blocked",
+                )
+
+            # ── ACCEL entry gate: only trade during ACCEL conditions ──
+            # W-hist<=0 + D-MACD<0 = confirmed bear momentum → allow shorts
+            # Otherwise block all entries
+            if _accel_entry_only and signal.action in {"buy", "short"}:
+                if not _accel_conditions:
+                    signal = StrategySignal(
+                        action="hold", confidence=0,
+                        reason="accel_entry_gate_blocked",
+                    )
+
+            # ── ACCEL entry block: avoid entries during ACCEL zone ──
+            # W-hist<=0 + D-MACD<0 = impulse crash → skip entries, wait for calmer zone
+            if _accel_entry_block and signal.action in {"buy", "short"}:
+                if _accel_conditions:
+                    signal = StrategySignal(
+                        action="hold", confidence=0,
+                        reason="accel_entry_block",
+                    )
 
             if signal.action in {"buy", "short"}:
                 stop_dist = 0.0
@@ -893,7 +977,10 @@ def run_backtest(
                         macro_last_trough_count, cycle_sig.trough_count,
                     )
 
-        equity_curve.append(broker.mark_to_market(symbol=symbol, market_price=current_bar.close))
+        # Include USDT reserves converted to BTC for accurate drawdown
+        _btc_equity = broker.mark_to_market(symbol=symbol, market_price=current_bar.close)
+        _usdt_as_btc = usdt_reserves / current_bar.close if current_bar.close > 0 else 0.0
+        equity_curve.append(_btc_equity + _usdt_as_btc)
 
     final_position = broker.get_position(symbol)
     if final_position.is_open and symbol in open_entries:
@@ -918,9 +1005,12 @@ def run_backtest(
                     contract_type=contract_type,
                 )
             )
-        equity_curve[-1] = broker.mark_to_market(symbol=symbol, market_price=last_bar.close)
+        _btc_eq = broker.mark_to_market(symbol=symbol, market_price=last_bar.close)
+        _usdt_btc = usdt_reserves / last_bar.close if last_bar.close > 0 else 0.0
+        equity_curve[-1] = _btc_eq + _usdt_btc
 
-    final_equity = equity_curve[-1]
+    # final_equity = BTC only (for BTC return reporting); equity_curve includes USDT for DD
+    final_equity = broker.mark_to_market(symbol=symbol, market_price=bars[-1].close)
     return BacktestResult(
         initial_cash=initial_cash,
         final_equity=final_equity,

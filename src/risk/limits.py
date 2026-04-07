@@ -8,6 +8,7 @@ from adapters.base import OrderRequest, Position
 @dataclass(frozen=True)
 class RiskLimits:
     max_position_pct: float = 0.90
+    min_position_pct: float = 0.0  # 0 = no floor; >0 = minimum margin % per trade
     risk_per_trade_pct: float = 0.02
     max_open_positions: int = 1
     leverage: int = 1
@@ -44,6 +45,9 @@ def calculate_order_quantity(
         risk_budget = cash * limits.risk_per_trade_pct
         notional = risk_budget / 0.02
 
+    # Apply floor and cap
+    margin_floor = cash * limits.min_position_pct * leverage if limits.min_position_pct > 0 else 0.0
+    notional = max(notional, margin_floor)
     notional = min(notional, margin_cap)
     quantity = max(notional / market_price, 0.0)
     return quantity * max(confidence_multiplier, 0.0)

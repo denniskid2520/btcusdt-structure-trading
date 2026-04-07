@@ -125,7 +125,7 @@ def _make_macro_cycle() -> MacroCycleConfig:
         # D+W sell: D>=75 + W>=70, sell 35%, monthly guard M>=65
         daily_rsi_sell_trigger=75.0,  # sell when daily RSI >= 75
         weekly_rsi_sell_confirm=70.0, # AND weekly RSI >= 70
-        daily_rsi_sell_pct=0.35,      # 35% of current BTC holdings
+        daily_rsi_sell_pct=0.45,      # 45% of current BTC holdings
         dw_sell_min_monthly_rsi=65.0, # guard: block sell if M-RSI < 65
         # Layer 1b: daily+weekly RSI oversold buying — DISABLED (keep USDT from sells)
         daily_rsi_buy_trigger=0.0,    # 0 = disabled

@@ -117,7 +117,11 @@ class TrendBreakoutConfig:
     cvd_divergence_filter: bool = False  # block when CVD diverges from price direction
     cvd_divergence_lookback: int = 6  # bars to compare CVD trend
     weekly_macd_short_gate: bool = False  # Block ALL shorts when weekly MACD golden cross (bullish)
+    weekly_macd_golden_cross_exit: bool = False  # Close ALL shorts when weekly MACD crosses golden (hist > 0)
     accel_trail_multiplier: float = 1.0  # ACCEL zone (W-hist<=0 + D-MACD<0): trail x N, block buys
+    weekly_regime_filter: bool = False  # W-MACD regime: golden cross→only longs, death cross→only shorts
+    accel_entry_only: bool = False  # Only allow entries during ACCEL zone (W-hist<=0 + D-MACD<0)
+    accel_entry_block: bool = False  # Block ALL entries during ACCEL zone (W-hist<=0 + D-MACD<0)
     bear_flag_max_weekly_rsi: float = 0.0  # 0=disabled. Block bear flag shorts when W-RSI > this
     loss_cooldown_count: int = 0  # 0=disabled. Block entries after N consecutive losses
     loss_cooldown_bars: int = 24  # bars to skip after hitting cooldown (24 = 4 days of 4h)

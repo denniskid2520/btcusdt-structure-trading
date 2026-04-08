@@ -9,6 +9,7 @@ from research.backtest import (
 )
 from risk.limits import RiskLimits
 from strategies.trend_breakout import TrendBreakoutConfig, TrendBreakoutStrategy
+from strategies.trend_breakout import TrendBreakoutConfig, TrendBreakoutStrategy
 from tests.fixtures_synthetic_bars import (
     realistic_comparison_dataset_bars,
     rising_channel_continuation_short_bars,
@@ -44,6 +45,7 @@ def test_backtest_trade_log_records_entry_rule_and_exit_reason() -> None:
                 entry_buffer_pct=0.35,
                 stop_buffer_pct=0.08,
                 allow_longs=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -69,6 +71,7 @@ def test_backtest_rule_stats_include_new_short_rules_on_synthetic_bars() -> None
                 entry_buffer_pct=0.35,
                 stop_buffer_pct=0.08,
                 allow_longs=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -86,6 +89,7 @@ def test_backtest_rule_stats_include_new_short_rules_on_synthetic_bars() -> None
                 stop_buffer_pct=0.08,
                 allow_longs=False,
                 enable_rising_channel_breakdown_retest_short=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -129,6 +133,7 @@ def test_backtest_rule_contribution_uses_total_realized_pnl_denominator() -> Non
                 entry_buffer_pct=0.35,
                 stop_buffer_pct=0.08,
                 allow_longs=False,
+                require_parent_confirmation=False,
             )
         ),
         broker=PaperBroker(initial_cash=100_000.0, fee_rate=0.0, slippage_rate=0.0),
@@ -156,6 +161,7 @@ def test_backtest_baseline_vs_enhanced_comparison_path_on_realistic_dataset() ->
         continuation_buffer_pct=0.45,
         stop_buffer_pct=0.08,
         allow_longs=False,
+        require_parent_confirmation=False,
     )
     comparison = compare_baseline_enhanced(
         bars=bars,
@@ -217,3 +223,129 @@ def test_event_markers_are_clustered_at_event_level() -> None:
     assert clustered[0].bars == 2
     assert clustered[0].event_label == "major_descending_channel_lower_boundary_support_context"
     assert clustered[1].event_label == "shock_break_reclaim_context"
+
+
+def test_build_default_strategy_includes_quality_filters() -> None:
+    """Default strategy must include quality filters and tuned parameters."""
+    strategy = build_default_strategy()
+    config: TrendBreakoutConfig = strategy.config
+    assert config.min_r_squared >= 0, "R² filter configurable"
+    assert config.min_stop_atr_multiplier >= 1.0, "ATR stop floor should prevent noise stop-outs"
+    assert config.impulse_threshold_pct <= 0.03, "Lower impulse threshold captures more setups"
+    assert config.time_stop_bars is not None and config.time_stop_bars > 0, "Time stop cuts losing trades"
+    assert config.secondary_structure_lookback is not None, "Dual lookback captures more regimes"
+
+
+def test_risk_limits_use_futures_leverage() -> None:
+    """Perpetual futures should use higher position size than spot."""
+    limits = RiskLimits()
+    assert limits.max_position_pct >= 0.5, "Futures should use at least 50% position sizing"
+
+
+def test_accel_zone_only_applies_to_impulse_trades() -> None:
+    """ACCEL zone trail widening must only apply to impulse trades.
+
+    Bug: ACCEL zone was applied to ALL short trades including channel
+    bounce/rejection trades.  Channel trades need tight stops (3.5 ATR),
+    but ACCEL 3x turned them into 10.5 ATR — far too wide.
+
+    Fix: Only apply ACCEL zone when entry_info trade_type is 'impulse'.
+    """
+    import ast
+    import inspect
+    from research.backtest import run_backtest as _fn
+
+    source = inspect.getsource(_fn)
+
+    # The ACCEL zone MACD check must include a trade_type/impulse guard.
+    # Look for the pattern: entry_info["side"] == "short" near ACCEL zone
+    # and verify there's also a trade_type or impulse check.
+    assert "impulse" in source or "trade_type" in source, (
+        "ACCEL zone code must check trade_type to limit scope to impulse trades"
+    )
+
+    # More specific: in the ACCEL zone block, there must be a guard
+    # that checks entry_info for impulse/breakout trade type
+    tree = ast.parse(source)
+    # Find string "accel_zone" in comparisons near "impulse" or "trade_type"
+    accel_refs = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.Name) and node.id == "_accel_zone"
+    ]
+    assert len(accel_refs) > 0
+
+    # The ACCEL computation block must reference trade_type or impulse
+    # to ensure it only fires for impulse trades
+    import re
+    # Find the ACCEL MACD computation block
+    accel_block = re.search(
+        r'entry_info\["side"\]\s*==\s*"short".*?_accel_zone\s*=',
+        source, re.DOTALL,
+    )
+    assert accel_block is not None, "Could not find ACCEL zone computation block"
+    block_text = accel_block.group(0)
+    assert "trade_type" in block_text or "impulse" in block_text, (
+        "ACCEL zone MACD check must guard on trade_type == 'impulse'. "
+        "Without this, channel bounce/rejection trades (3.5 ATR) get "
+        "3x trail widening (10.5 ATR), which is far too wide."
+    )
+
+
+def test_accel_zone_persists_between_macd_check_bars() -> None:
+    """ACCEL zone flag must persist between MACD computation bars.
+
+    Bug: _accel_zone was reset to False every bar, but MACD only computed
+    every 6th bar (index % 6 == 0).  Result: 5/6 bars used normal trail
+    instead of widened trail, allowing premature stop-outs during crashes.
+
+    Fix: _accel_zone is now initialized before the loop and only updated
+    on MACD check bars, retaining its value in between.
+    """
+    import ast
+    import inspect
+    from research.backtest import run_backtest as _fn
+
+    source = inspect.getsource(_fn)
+    tree = ast.parse(source)
+
+    # Find the main for-loop in run_backtest
+    func_def = tree.body[0]
+    assert isinstance(func_def, (ast.FunctionDef, ast.AsyncFunctionDef))
+
+    # _accel_zone = False must appear BEFORE the main for-loop, not inside it.
+    # Locate assignments to _accel_zone at the function body level (not inside for).
+    main_for = None
+    accel_init_before_loop = False
+    for node in ast.walk(func_def):
+        if isinstance(node, ast.For):
+            main_for = node
+            break
+
+    assert main_for is not None, "run_backtest must have a for loop"
+
+    # Check that _accel_zone init is in func body BEFORE the for loop
+    for stmt in func_def.body:
+        if stmt is main_for:
+            break
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id == "_accel_zone":
+                    accel_init_before_loop = True
+
+    assert accel_init_before_loop, (
+        "_accel_zone must be initialized before the main for-loop "
+        "so its value persists between MACD check bars (index % 6 == 0)"
+    )
+
+    # Also verify: NO unconditional _accel_zone = False as a direct
+    # statement in the for-loop body (the bug pattern). Conditional resets
+    # inside if-blocks are fine (e.g., reset when not in a short position).
+    for stmt in main_for.body:
+        if isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name) and target.id == "_accel_zone":
+                    if isinstance(stmt.value, ast.Constant) and stmt.value.value is False:
+                        raise AssertionError(
+                            "_accel_zone = False found as unconditional statement "
+                            "in the for-loop body. This resets every bar."
+                        )

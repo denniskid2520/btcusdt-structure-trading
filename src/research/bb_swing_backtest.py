@@ -98,6 +98,7 @@ class BBConfig:
     # Bollinger Bands
     bb_period: int = 20
     bb_k: float = 2.0
+    bb_type: str = "sma"  # "sma" or "ema" (HBEM 2024: EMA Sharpe 3.22)
 
     # Entry
     band_touch_pct: float = 0.01  # within 1% of band counts as "touch"
@@ -110,6 +111,10 @@ class BBConfig:
     use_trailing_stop: bool = False
     trailing_activation_pct: float = 0.03  # activate after 3% profit
     trailing_atr_multiplier: float = 2.0
+
+    # Asymmetric entry (Beluska & Vojtko 2024)
+    # BTC trends at highs, reverts at lows → long-only at lower band
+    asymmetric_entry: bool = False
 
     # Filters
     use_ma200_filter: bool = False
@@ -171,15 +176,27 @@ class TradeRecord:
 # Indicator calculations
 # ===========================================================================
 
-def calculate_bb(prices: list[float], period: int, k: float) -> BBState | None:
+def calculate_bb(
+    prices: list[float], period: int, k: float, use_ema: bool = False,
+) -> BBState | None:
     """Compute Bollinger Bands from a list of close prices.
+
+    Args:
+        use_ema: If True, use EMA as center line instead of SMA.
+                 Std dev is always computed on the last `period` values.
+                 (HBEM 2024: EMA-based BB → Sharpe 3.22 on crypto futures)
 
     Returns None if insufficient data.
     """
     if len(prices) < period:
         return None
     window = prices[-period:]
-    middle = statistics.mean(window)
+    if use_ema:
+        middle = calculate_ema(prices, period)
+        if middle is None:
+            return None
+    else:
+        middle = statistics.mean(window)
     if period < 2:
         return BBState(middle=middle, upper=middle, lower=middle, width_pct=0.0)
     std = statistics.stdev(window)
@@ -298,6 +315,23 @@ def calculate_sma(prices: list[float], period: int) -> float | None:
     return sum(prices[-period:]) / period
 
 
+def calculate_ema(prices: list[float], period: int) -> float | None:
+    """Exponential Moving Average (EMA).
+
+    Seed with SMA of first `period` values, then apply EMA smoothing.
+    Returns None if insufficient data.
+    """
+    if len(prices) < period:
+        return None
+    # Seed: SMA of first `period` values
+    ema = sum(prices[:period]) / period
+    # Multiplier: 2 / (period + 1)
+    k = 2.0 / (period + 1)
+    for price in prices[period:]:
+        ema = price * k + ema * (1 - k)
+    return ema
+
+
 def calculate_mfi(bars: list[dict], period: int = 14) -> float | None:
     """Money Flow Index — combines price and volume.
 
@@ -375,7 +409,7 @@ def check_entry_signal(
 ) -> str | None:
     """Return 'long', 'short', or None."""
     # Cooldown check
-    if last_exit_ts is not None:
+    if last_exit_ts is not None and current_ts is not None:
         delta = current_ts - last_exit_ts
         if delta < timedelta(days=config.cooldown_days):
             return None
@@ -400,6 +434,10 @@ def check_entry_signal(
     elif close >= touch_margin_upper:
         signal = "short"
     else:
+        return None
+
+    # Asymmetric mode: only allow longs (Beluska & Vojtko 2024)
+    if config.asymmetric_entry and signal == "short":
         return None
 
     # MA200 filter
@@ -749,7 +787,10 @@ def run_bb_backtest(
         # to avoid lookahead bias: at 4h intraday we don't know today's close)
         d_closes = daily_closes[:daily_idx]
 
-        bb = calculate_bb(d_closes, period=config.bb_period, k=config.bb_k)
+        bb = calculate_bb(
+            d_closes, period=config.bb_period, k=config.bb_k,
+            use_ema=(config.bb_type == "ema"),
+        )
         if bb is None:
             equity_curve.append(capital)
             continue

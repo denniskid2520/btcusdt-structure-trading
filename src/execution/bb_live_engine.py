@@ -40,21 +40,25 @@ class BBLiveConfig:
     leverage: int = 5
     initial_usdt: float = 10000.0
     fee_rate: float = 0.001
-    # BB strategy params
+    # BB strategy params — Config [E]: optimized via 1080-config sweep
     bb_period: int = 20
     bb_k: float = 2.5
+    bb_type: str = "sma"  # "sma" or "ema" (HBEM 2024)
     band_touch_pct: float = 0.01
-    stop_loss_pct: float = 0.03
-    risk_per_trade: float = 0.065
+    stop_loss_pct: float = 0.035  # widened from 3% to 3.5%
+    risk_per_trade: float = 0.10   # raised from 6.5% to 10%
     max_margin_pct: float = 0.90
     use_ma200: bool = True
     use_trailing_stop: bool = True
     trailing_activation_pct: float = 0.03
-    trailing_atr_multiplier: float = 1.5
+    trailing_atr_multiplier: float = 2.0  # raised from 1.5 to 2.0
     max_hold_bars: int = 180  # 30 days * 6 bars/day
     cooldown_days: int = 1
     min_band_width_pct: float = 3.0
     max_band_width_pct: float = 30.0
+    # 15m entry confirmation (wait for micro-breakout)
+    use_15m_confirmation: bool = True
+    confirm_max_wait_bars: int = 6  # 6 × 4h = 24h window
     # Live trading mode
     live_mode: bool = False
 
@@ -83,6 +87,14 @@ class BBLiveState:
     last_candle_ts: str = ""
     bars_since_entry: int = 0
     last_exit_ts: str = ""
+    # 15m confirmation pending signal
+    pending_signal_side: str = ""      # "long" or "short" or "" (no pending)
+    pending_signal_bar: int = 0        # bar index when signal was created
+    pending_signal_bb_upper: float = 0.0
+    pending_signal_bb_middle: float = 0.0
+    pending_signal_bb_lower: float = 0.0
+    pending_signal_bb_width: float = 0.0
+    tick_count: int = 0                # monotonic bar counter
 
     @property
     def is_position_open(self) -> bool:
@@ -167,7 +179,10 @@ class BBLiveEngine:
         # Calculate indicators from native 1d bars
         # Exclude the last (current/incomplete) daily bar to avoid lookahead
         daily_closes = [b.close for b in bars_1d[:-1]]
-        bb = calculate_bb(daily_closes, period=self.cfg.bb_period, k=self.cfg.bb_k)
+        bb = calculate_bb(
+            daily_closes, period=self.cfg.bb_period, k=self.cfg.bb_k,
+            use_ema=(self.cfg.bb_type == "ema"),
+        )
         if bb is None:
             LOGGER.warning("Not enough daily bars for BB")
             self._save()
@@ -198,8 +213,47 @@ class BBLiveEngine:
             "position": self.state.position_side,
         }
 
+        self.state.tick_count += 1
+
         if not self.state.is_position_open:
-            result.update(self._check_entry(close, bb, ma200))
+            # Handle pending 15m confirmation signal
+            if self.state.pending_signal_side:
+                wait = self.state.tick_count - self.state.pending_signal_bar
+                if wait > self.cfg.confirm_max_wait_bars:
+                    LOGGER.info("Pending %s signal expired after %d bars",
+                               self.state.pending_signal_side, wait)
+                    self._clear_pending_signal()
+                else:
+                    # Check confirmation: current 4h bar breaks prev bar's high/low
+                    prev_4h = bars_4h[-3] if len(bars_4h) >= 3 else bars_4h[-2]
+                    confirmed = False
+                    if self.state.pending_signal_side == "long":
+                        confirmed = close > prev_4h.high
+                    elif self.state.pending_signal_side == "short":
+                        confirmed = close < prev_4h.low
+
+                    if confirmed:
+                        signal_side = self.state.pending_signal_side
+                        LOGGER.info("15m confirmation triggered for %s after %d bars",
+                                   signal_side, wait)
+                        # Restore BB state from when signal was created
+                        from research.bb_swing_backtest import BBState
+                        saved_bb = BBState(
+                            middle=self.state.pending_signal_bb_middle,
+                            upper=self.state.pending_signal_bb_upper,
+                            lower=self.state.pending_signal_bb_lower,
+                            width_pct=self.state.pending_signal_bb_width,
+                        )
+                        self._clear_pending_signal()
+                        result.update(self._do_entry(close, signal_side, saved_bb))
+                    else:
+                        result["action"] = "pending_confirmation"
+                        result["pending_side"] = self.state.pending_signal_side
+                        result["bars_waiting"] = wait
+
+            # Check for new signal (only if no pending and no position)
+            if not self.state.is_position_open and not self.state.pending_signal_side:
+                result.update(self._check_entry(close, bb, ma200))
         else:
             self.state.bars_since_entry += 1
             result.update(self._check_exit(close, bb, atr))
@@ -243,6 +297,29 @@ class BBLiveEngine:
             if signal == "short" and close > ma200:
                 return {"action": "blocked_ma200", "signal": signal, "reason": "price above MA200, short blocked"}
 
+        # 15m confirmation mode: defer entry, save as pending signal
+        if self.cfg.use_15m_confirmation:
+            self.state.pending_signal_side = signal
+            self.state.pending_signal_bar = self.state.tick_count
+            self.state.pending_signal_bb_upper = bb.upper
+            self.state.pending_signal_bb_middle = bb.middle
+            self.state.pending_signal_bb_lower = bb.lower
+            self.state.pending_signal_bb_width = bb.width_pct
+            LOGGER.info("Pending %s signal at $%.0f — waiting for 15m confirmation", signal, close)
+            return {
+                "action": "pending_signal",
+                "signal": signal,
+                "price": close,
+                "bb_upper": bb.upper,
+                "bb_middle": bb.middle,
+                "bb_lower": bb.lower,
+            }
+
+        # Immediate entry (no 15m confirmation)
+        return self._do_entry(close, signal, bb)
+
+    def _do_entry(self, close: float, signal: str, bb: Any) -> dict:
+        """Execute entry: size, order, state update."""
         # Position sizing
         qty = self._calc_position_size(close)
         if qty <= 0:
@@ -308,6 +385,15 @@ class BBLiveEngine:
             "bb_lower": bb.lower,
             "live": self.broker is not None,
         }
+
+    def _clear_pending_signal(self) -> None:
+        """Clear the pending 15m confirmation signal."""
+        self.state.pending_signal_side = ""
+        self.state.pending_signal_bar = 0
+        self.state.pending_signal_bb_upper = 0.0
+        self.state.pending_signal_bb_middle = 0.0
+        self.state.pending_signal_bb_lower = 0.0
+        self.state.pending_signal_bb_width = 0.0
 
     def _check_exit(self, close: float, bb: Any, atr: float | None) -> dict:
         """Check exit conditions for open position."""

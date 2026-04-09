@@ -692,7 +692,12 @@ def run_bb_backtest(
                 last_exit_ts = current_ts
                 entry_bb = None
 
-        equity_curve.append(capital)
+        # Mark-to-market: record equity including unrealized PnL for open positions
+        if position_side is not None:
+            unrealized = _calc_pnl(position_side, qty_btc, entry_price, close)
+            equity_curve.append(capital + unrealized)
+        else:
+            equity_curve.append(capital)
 
     # Force close any open position at end
     if position_side is not None:
@@ -718,6 +723,7 @@ def run_bb_backtest(
         })
         capital += pnl
         capital = max(capital, min_capital)
+        equity_curve.append(capital)  # P2 fix: include forced close in curve
 
     # Compute summary stats
     initial = initial_capital if is_linear else initial_btc

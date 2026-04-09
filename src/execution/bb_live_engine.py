@@ -1,15 +1,18 @@
-"""Live paper trading engine for Strategy D — BB Swing (USDT-M).
+"""Trading engine for Strategy D — BB Swing (USDT-M).
 
+Supports both paper trading and live exchange execution.
 Fetches Binance native 1d bars, calculates BB(20,2.5) + MA200,
-checks entry/exit signals on 4h bars, and manages paper positions.
+checks entry/exit signals on 4h bars, and manages positions.
 State persisted to JSON.
 
-Run via: PYTHONPATH=src python run_paper_d.py --once
+Paper: PYTHONPATH=src python run_paper_d.py --once
+Live:  PYTHONPATH=src python run_live_d.py --once
 """
 from __future__ import annotations
 
 import json
 import logging
+import math
 import statistics
 import time
 from dataclasses import dataclass, field, asdict
@@ -52,6 +55,8 @@ class BBLiveConfig:
     cooldown_days: int = 1
     min_band_width_pct: float = 3.0
     max_band_width_pct: float = 30.0
+    # Live trading mode
+    live_mode: bool = False
 
 
 # ── Persistent State ──
@@ -103,7 +108,7 @@ class BBLiveState:
 # ── Engine ──
 
 class BBLiveEngine:
-    """Paper trading engine for BB Swing Strategy D."""
+    """Trading engine for BB Swing Strategy D (paper + live)."""
 
     def __init__(
         self,
@@ -117,9 +122,24 @@ class BBLiveEngine:
             self.state.usdt_balance = self.cfg.initial_usdt
         self.adapter = BinanceFuturesAdapter()
 
+        # Live broker (only created when live_mode=True)
+        self.broker = None
+        if self.cfg.live_mode:
+            from adapters.binance_futures_broker import BinanceFuturesBroker
+            self.broker = BinanceFuturesBroker()
+            LOGGER.info("LIVE MODE — orders will be sent to Binance")
+
     def tick(self) -> dict[str, Any]:
         """Single evaluation tick. Call this on each 4h candle."""
         result: dict[str, Any] = {"action": "none", "signal": None}
+
+        # Live mode: sync position from exchange first
+        if self.broker:
+            sync_result = self._sync_position()
+            if sync_result:
+                # Position was closed on exchange (stop loss hit)
+                self._save()
+                return sync_result
 
         # Fetch data
         bars_4h = self.adapter.fetch_ohlcv(self.cfg.symbol, "4h", 30)
@@ -222,7 +242,38 @@ class BBLiveEngine:
         if qty <= 0:
             return {"action": "size_zero"}
 
-        # Execute entry
+        # Live mode: place real orders on exchange
+        if self.broker:
+            try:
+                qty = math.floor(qty * 1000) / 1000  # Binance step size
+                if qty < 0.001:
+                    return {"action": "size_zero", "reason": "below minimum 0.001 BTC"}
+
+                order_side = "BUY" if signal == "long" else "SELL"
+                order_result = self.broker.place_market_order(self.cfg.symbol, order_side, qty)
+                LOGGER.info("LIVE ENTRY order: %s", order_result.get("orderId"))
+
+                # Place stop loss on exchange as safety net
+                stop_side = "SELL" if signal == "long" else "BUY"
+                if signal == "long":
+                    stop_price = close * (1 - self.cfg.stop_loss_pct)
+                else:
+                    stop_price = close * (1 + self.cfg.stop_loss_pct)
+                self.broker.place_stop_market(self.cfg.symbol, stop_side, qty, stop_price)
+
+                # Sync actual fill from exchange
+                time.sleep(0.5)
+                pos = self.broker.get_position(self.cfg.symbol)
+                if pos["entry_price"] > 0:
+                    close = pos["entry_price"]  # Use actual fill price
+                    qty = pos["qty"]
+                LOGGER.info("LIVE position synced: %s %.3f @ $%.0f", pos["side"], qty, close)
+
+            except Exception as e:
+                LOGGER.error("LIVE ENTRY FAILED: %s", e)
+                return {"action": "entry_failed", "error": str(e)}
+
+        # Update local state
         self.state.position_side = signal
         self.state.position_qty = qty
         self.state.entry_price = close
@@ -236,8 +287,9 @@ class BBLiveEngine:
         self.state.bb_width_pct = bb.width_pct
 
         notional = qty * close
-        LOGGER.info("ENTRY %s | %.4f BTC @ $%.0f | notional $%.0f | BB: %.0f/%.0f/%.0f",
-                     signal.upper(), qty, close, notional, bb.lower, bb.middle, bb.upper)
+        mode = "LIVE" if self.broker else "PAPER"
+        LOGGER.info("[%s] ENTRY %s | %.4f BTC @ $%.0f | notional $%.0f | BB: %.0f/%.0f/%.0f",
+                     mode, signal.upper(), qty, close, notional, bb.lower, bb.middle, bb.upper)
 
         return {
             "action": "entry",
@@ -248,6 +300,7 @@ class BBLiveEngine:
             "bb_upper": bb.upper,
             "bb_middle": bb.middle,
             "bb_lower": bb.lower,
+            "live": self.broker is not None,
         }
 
     def _check_exit(self, close: float, bb: Any, atr: float | None) -> dict:
@@ -305,6 +358,40 @@ class BBLiveEngine:
         qty = self.state.position_qty
         entry = self.state.entry_price
 
+        # Live mode: close position on exchange
+        if self.broker and reason != "exchange_stop_loss":
+            try:
+                # Cancel pending stop loss order first
+                self.broker.cancel_all_orders(self.cfg.symbol)
+
+                # Check if position still exists on exchange
+                pos = self.broker.get_position(self.cfg.symbol)
+                if pos["side"] == "flat":
+                    LOGGER.info("Position already closed on exchange (stop may have fired)")
+                    reason = "exchange_stop_loss"
+                    # Get actual fill price from recent trades
+                    trades = self.broker.get_recent_trades(self.cfg.symbol, 1)
+                    if trades:
+                        close = float(trades[0]["price"])
+                else:
+                    # Place market close order
+                    close_side = "SELL" if side == "long" else "BUY"
+                    close_qty = pos["qty"]  # Use exchange qty for precision
+                    order_result = self.broker.place_market_order(
+                        self.cfg.symbol, close_side, close_qty
+                    )
+                    LOGGER.info("LIVE EXIT order: %s", order_result.get("orderId"))
+
+                    # Get actual fill price
+                    time.sleep(0.5)
+                    trades = self.broker.get_recent_trades(self.cfg.symbol, 1)
+                    if trades:
+                        close = float(trades[0]["price"])
+
+            except Exception as e:
+                LOGGER.error("LIVE EXIT FAILED: %s — position may still be open!", e)
+                return {"action": "exit_failed", "error": str(e)}
+
         # Linear PnL
         if side == "long":
             gross = qty * (close - entry)
@@ -314,9 +401,19 @@ class BBLiveEngine:
         pnl = gross - fees
         pnl_pct = pnl / self.state.usdt_balance * 100 if self.state.usdt_balance > 0 else 0
 
-        self.state.usdt_balance += pnl
+        # Live mode: sync real balance from exchange
+        if self.broker:
+            try:
+                bal = self.broker.get_balance()
+                self.state.usdt_balance = bal["wallet"]
+                LOGGER.info("LIVE balance synced: $%.2f", bal["wallet"])
+            except Exception:
+                self.state.usdt_balance += pnl
+        else:
+            self.state.usdt_balance += pnl
         self.state.usdt_balance = max(self.state.usdt_balance, 1.0)
 
+        mode = "LIVE" if self.broker else "PAPER"
         trade = {
             "entry_ts": self.state.entry_time,
             "exit_ts": self.state.last_candle_ts,
@@ -330,11 +427,12 @@ class BBLiveEngine:
             "bb_upper": self.state.bb_upper,
             "bb_middle": self.state.bb_middle,
             "bb_lower": self.state.bb_lower,
+            "mode": mode,
         }
         self.state.trades.append(trade)
 
-        LOGGER.info("EXIT %s %s | %.4f BTC @ $%.0f | PnL $%.0f (%.1f%%) | Balance $%.0f",
-                     reason.upper(), side.upper(), qty, close, pnl, pnl_pct, self.state.usdt_balance)
+        LOGGER.info("[%s] EXIT %s %s | %.4f BTC @ $%.0f | PnL $%.0f (%.1f%%) | Balance $%.0f",
+                     mode, reason.upper(), side.upper(), qty, close, pnl, pnl_pct, self.state.usdt_balance)
 
         # Reset position
         self.state.position_side = "flat"
@@ -351,7 +449,56 @@ class BBLiveEngine:
             "pnl_pct": round(pnl_pct, 2),
             "balance": round(self.state.usdt_balance, 2),
             "trade": trade,
+            "live": self.broker is not None,
         }
+
+    def _sync_position(self) -> dict | None:
+        """Sync position state from exchange. Returns exit dict if stopped out."""
+        if not self.broker:
+            return None
+
+        try:
+            pos = self.broker.get_position(self.cfg.symbol)
+        except Exception as e:
+            LOGGER.warning("Position sync failed: %s", e)
+            return None
+
+        # Case 1: We think we have a position, but exchange says flat → stopped out
+        if self.state.is_position_open and pos["side"] == "flat":
+            LOGGER.warning("Position gone from exchange — stop loss likely triggered")
+            # Get fill price from recent trades
+            try:
+                trades = self.broker.get_recent_trades(self.cfg.symbol, 1)
+                fill_price = float(trades[0]["price"]) if trades else 0
+            except Exception:
+                fill_price = 0
+
+            if fill_price == 0:
+                # Estimate from stop loss level
+                if self.state.position_side == "long":
+                    fill_price = self.state.entry_price * (1 - self.cfg.stop_loss_pct)
+                else:
+                    fill_price = self.state.entry_price * (1 + self.cfg.stop_loss_pct)
+
+            return self._execute_exit(fill_price, "exchange_stop_loss")
+
+        # Case 2: Exchange has position, verify consistency
+        if pos["side"] != "flat" and self.state.is_position_open:
+            if abs(pos["qty"] - self.state.position_qty) > 0.001:
+                LOGGER.warning("Qty mismatch: state=%.3f exchange=%.3f — syncing",
+                             self.state.position_qty, pos["qty"])
+                self.state.position_qty = pos["qty"]
+
+        # Case 3: Exchange has position but we think we're flat → manual trade?
+        if pos["side"] != "flat" and not self.state.is_position_open:
+            LOGGER.warning("Exchange has %s position but state is flat — adopting",
+                         pos["side"])
+            self.state.position_side = pos["side"]
+            self.state.position_qty = pos["qty"]
+            self.state.entry_price = pos["entry_price"]
+            self.state.entry_time = datetime.now(timezone.utc).isoformat()
+
+        return None
 
     def _calc_position_size(self, price: float) -> float:
         """Risk-based position size in BTC."""
@@ -368,7 +515,8 @@ class BBLiveEngine:
         """Print current status to stdout."""
         s = self.state
         print(f"\n{'='*60}")
-        print(f"  Strategy D — BB Swing Paper Trading")
+        mode = "LIVE" if self.cfg.live_mode else "PAPER"
+        print(f"  Strategy D — BB Swing [{mode}]")
         print(f"{'='*60}")
         print(f"  Balance:   ${s.usdt_balance:,.2f} USDT")
         print(f"  Position:  {s.position_side}")

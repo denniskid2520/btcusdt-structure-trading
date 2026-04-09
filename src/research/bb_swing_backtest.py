@@ -30,6 +30,69 @@ class BBState:
 
 
 @dataclass
+class PendingSignal:
+    """A signal waiting for 15m confirmation before entry."""
+    side: str          # "long" or "short"
+    trigger_price: float
+    bar_idx: int       # 15m bar index when signal was created
+    max_wait: int = 16  # 16 × 15m = 4 hours
+
+    def is_expired(self, current_bar_idx: int) -> bool:
+        return current_bar_idx > self.bar_idx + self.max_wait
+
+
+def check_15m_confirmation(bars_15m: list[dict], side: str) -> bool:
+    """Check if 15m bars confirm a pending signal.
+
+    Long:  last 15m close > previous 15m high (bullish micro-breakout)
+    Short: last 15m close < previous 15m low  (bearish micro-breakout)
+    """
+    if len(bars_15m) < 2:
+        return False
+    prev = bars_15m[-2]
+    last = bars_15m[-1]
+    if side == "long":
+        return last["close"] > prev["high"]
+    elif side == "short":
+        return last["close"] < prev["low"]
+    return False
+
+
+def get_confirmed_entry_price(bars_15m: list[dict], side: str) -> float | None:
+    """Return 15m close price if confirmed, else None."""
+    if check_15m_confirmation(bars_15m, side):
+        return bars_15m[-1]["close"]
+    return None
+
+
+def calc_micro_stop(
+    bars_15m: list[dict],
+    side: str,
+    lookback: int = 3,
+    entry_price: float = 0.0,
+    max_pct: float = 0.0,
+) -> float:
+    """Calculate stop loss from 15m swing low/high.
+
+    Long:  stop = lowest low of last N bars
+    Short: stop = highest high of last N bars
+    If max_pct > 0 and entry_price > 0, cap the stop distance.
+    """
+    recent = bars_15m[-lookback:] if len(bars_15m) >= lookback else bars_15m
+    if side == "long":
+        stop = min(b["low"] for b in recent)
+        if max_pct > 0 and entry_price > 0:
+            floor = entry_price * (1 - max_pct)
+            stop = max(stop, floor)
+    else:
+        stop = max(b["high"] for b in recent)
+        if max_pct > 0 and entry_price > 0:
+            ceiling = entry_price * (1 + max_pct)
+            stop = min(stop, ceiling)
+    return stop
+
+
+@dataclass
 class BBConfig:
     """All configurable parameters for the BB swing strategy."""
     # Bollinger Bands
@@ -59,6 +122,20 @@ class BBConfig:
     adx_threshold: float = 25.0
     min_band_width_pct: float = 3.0
     max_band_width_pct: float = 30.0
+
+    # MFI (Money Flow Index) — Bollinger's %B + MFI system
+    use_mfi_filter: bool = False
+    mfi_period: int = 14
+    mfi_oversold: float = 20.0
+    mfi_overbought: float = 80.0
+
+    # 15m entry confirmation
+    use_15m_confirmation: bool = False
+    confirm_max_wait_bars: int = 6  # 6 × 4h = 24h window to get 15m confirm
+
+    # Volume spike filter
+    use_volume_spike: bool = False
+    volume_spike_multiplier: float = 1.5
 
     # Position sizing
     risk_per_trade: float = 0.05
@@ -219,6 +296,67 @@ def calculate_sma(prices: list[float], period: int) -> float | None:
     if len(prices) < period:
         return None
     return sum(prices[-period:]) / period
+
+
+def calculate_mfi(bars: list[dict], period: int = 14) -> float | None:
+    """Money Flow Index — combines price and volume.
+
+    MFI = 100 - 100 / (1 + positive_flow / negative_flow)
+    Typical Price = (H + L + C) / 3
+    Raw Money Flow = Typical Price × Volume
+    """
+    if len(bars) < period + 1:
+        return None
+
+    recent = bars[-(period + 1):]
+    positive_flow = 0.0
+    negative_flow = 0.0
+
+    for i in range(1, len(recent)):
+        prev_tp = (recent[i - 1]["high"] + recent[i - 1]["low"] + recent[i - 1]["close"]) / 3
+        curr_tp = (recent[i]["high"] + recent[i]["low"] + recent[i]["close"]) / 3
+        raw_flow = curr_tp * recent[i]["volume"]
+
+        if curr_tp > prev_tp:
+            positive_flow += raw_flow
+        else:
+            negative_flow += raw_flow
+
+    if negative_flow == 0:
+        return 100.0 if positive_flow > 0 else 50.0
+    if positive_flow == 0:
+        return 0.0
+
+    ratio = positive_flow / negative_flow
+    return 100.0 - 100.0 / (1.0 + ratio)
+
+
+def check_bb_mfi_confirmation(pct_b: float, mfi: float, side: str) -> bool:
+    """Bollinger's %B + MFI system.
+
+    Long:  %B < 0.2 AND MFI < 20  (oversold + volume confirms)
+    Short: %B > 0.8 AND MFI > 80  (overbought + volume confirms)
+    """
+    if side == "long":
+        return pct_b < 0.2 and mfi < 20
+    elif side == "short":
+        return pct_b > 0.8 and mfi > 80
+    return False
+
+
+def detect_volume_spike(
+    volumes: list[float], multiplier: float = 2.0,
+) -> bool:
+    """Detect if the last volume is a spike above average.
+
+    Returns True if last volume > multiplier × average of preceding volumes.
+    """
+    if len(volumes) < 2:
+        return False
+    avg = sum(volumes[:-1]) / len(volumes[:-1])
+    if avg == 0:
+        return False
+    return volumes[-1] > multiplier * avg
 
 
 # ===========================================================================
@@ -569,6 +707,7 @@ def run_bb_backtest(
     max_profit_pct = 0.0
     last_exit_ts: datetime | None = None
     entry_bb: BBState | None = None
+    pending_signal: PendingSignal | None = None
 
     trades: list[dict] = []
     equity_curve: list[float] = [capital]
@@ -634,21 +773,78 @@ def run_bb_backtest(
             atr_bars = bars_4h[max(0, i - 20):i + 1]
             atr = calculate_atr(atr_bars, period=14)
 
+        # MFI on daily bars (volume-weighted momentum)
+        mfi = None
+        if config.use_mfi_filter:
+            mfi = calculate_mfi(daily_bars[:daily_idx], period=config.mfi_period)
+
+        # %B for MFI confirmation
+        pct_b = (close - bb.lower) / (bb.upper - bb.lower) if bb.upper != bb.lower else 0.5
+
+        # Volume spike on 4h bars
+        vol_spike = False
+        if config.use_volume_spike and i >= 10:
+            vols = [b["volume"] for b in bars_4h[max(0, i - 10):i + 1]]
+            vol_spike = detect_volume_spike(vols, config.volume_spike_multiplier)
+
         if position_side is None:
-            # Check entry
-            signal = check_entry_signal(
-                close=close, bb=bb, ma200=ma200, rsi3=rsi3, adx=adx,
-                config=config, last_exit_ts=last_exit_ts, current_ts=current_ts,
-            )
-            if signal is not None:
-                qty_btc = _calc_size(close)
-                if qty_btc > 0:
-                    position_side = signal
-                    entry_price = close
-                    entry_ts = current_ts
-                    entry_bar_idx = i
-                    max_profit_pct = 0.0
-                    entry_bb = bb
+            # Handle pending 15m confirmation signal
+            if pending_signal is not None:
+                if i - pending_signal.bar_idx > config.confirm_max_wait_bars:
+                    pending_signal = None  # expired
+                else:
+                    # Simulate 15m confirmation: use 4h bar structure as proxy
+                    # In backtest we check if the 4h bar shows reversal pattern
+                    # (close recovers from the signal direction)
+                    prev_bar = bars_4h[i - 1] if i > 0 else bar
+                    if pending_signal.side == "long":
+                        confirmed = close > prev_bar["high"]
+                    else:
+                        confirmed = close < prev_bar["low"]
+
+                    if confirmed:
+                        qty_btc = _calc_size(close)
+                        if qty_btc > 0:
+                            position_side = pending_signal.side
+                            entry_price = close
+                            entry_ts = current_ts
+                            entry_bar_idx = i
+                            max_profit_pct = 0.0
+                            entry_bb = bb
+                            pending_signal = None
+
+            # Check for new entry signal
+            if position_side is None and pending_signal is None:
+                signal = check_entry_signal(
+                    close=close, bb=bb, ma200=ma200, rsi3=rsi3, adx=adx,
+                    config=config, last_exit_ts=last_exit_ts, current_ts=current_ts,
+                )
+                if signal is not None:
+                    # MFI filter: require volume confirmation
+                    if config.use_mfi_filter and mfi is not None:
+                        if not check_bb_mfi_confirmation(pct_b, mfi, signal):
+                            signal = None  # volume not confirming
+
+                    # Volume spike filter
+                    if signal and config.use_volume_spike and not vol_spike:
+                        signal = None  # no volume spike at band touch
+
+                if signal is not None:
+                    if config.use_15m_confirmation:
+                        # Don't enter immediately — create pending signal
+                        pending_signal = PendingSignal(
+                            side=signal, trigger_price=close, bar_idx=i,
+                            max_wait=config.confirm_max_wait_bars,
+                        )
+                    else:
+                        qty_btc = _calc_size(close)
+                        if qty_btc > 0:
+                            position_side = signal
+                            entry_price = close
+                            entry_ts = current_ts
+                            entry_bar_idx = i
+                            max_profit_pct = 0.0
+                            entry_bb = bb
         else:
             # Track max profit for trailing stop
             if position_side == "long":

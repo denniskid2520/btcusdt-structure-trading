@@ -18,6 +18,10 @@ from adapters.coinglass_client import (
     TopLSRatioBar,
     CVDBar,
     BasisBar,
+    OIBar,
+    FundingRateBar,
+    LiquidationBar,
+    TakerVolumeBar,
 )
 
 
@@ -116,6 +120,119 @@ MOCK_BASIS_RESPONSE = {
     ],
 }
 
+# Pair-level (BTCUSDT) endpoints — Strategy C main series
+# All response fields verified against live Coinglass API on 2026-04-10
+
+MOCK_PAIR_OI_RESPONSE = {
+    "code": "0",
+    "data": [
+        {
+            "time": 1704067200000,
+            "open": "6720131978",
+            "high": "6724383023",
+            "low": "6713865410",
+            "close": "6724383023",
+        },
+        {
+            "time": 1704068100000,  # +15m
+            "open": "6724383023",
+            "high": "6724612216",
+            "low": 6722441838.35,
+            "close": 6722441838.35,
+        },
+    ],
+}
+
+MOCK_PAIR_FUNDING_RESPONSE = {
+    "code": "0",
+    "data": [
+        {
+            "time": 1704067200000,
+            "open": "0.003327",
+            "high": "0.003327",
+            "low": "0.002933",
+            "close": "0.002933",
+        },
+        {
+            "time": 1704068100000,
+            "open": "0.002933",
+            "high": "0.003100",
+            "low": "0.002850",
+            "close": "0.003050",
+        },
+    ],
+}
+
+MOCK_PAIR_LIQUIDATION_RESPONSE = {
+    "code": "0",
+    "data": [
+        {
+            "time": 1704067200000,
+            "long_liquidation_usd": "12345.67",
+            "short_liquidation_usd": "98765.43",
+        },
+        {
+            "time": 1704068100000,
+            "long_liquidation_usd": "0",
+            "short_liquidation_usd": "5000.00",
+        },
+    ],
+}
+
+MOCK_PAIR_TAKER_VOLUME_RESPONSE = {
+    "code": "0",
+    "data": [
+        {
+            "time": 1704067200000,
+            "taker_buy_volume_usd": "27145645.4238",
+            "taker_sell_volume_usd": "29482062.3163",
+        },
+        {
+            "time": 1704068100000,
+            "taker_buy_volume_usd": "30000000.00",
+            "taker_sell_volume_usd": "25000000.00",
+        },
+    ],
+}
+
+MOCK_PAIR_CVD_RESPONSE = {
+    "code": "0",
+    "data": [
+        {
+            "time": 1704067200000,
+            "taker_buy_vol": 27145645.4238,
+            "taker_sell_vol": 29482062.3163,
+            "cum_vol_delta": -2336416.8925,
+        },
+        {
+            "time": 1704068100000,
+            "taker_buy_vol": 30000000.00,
+            "taker_sell_vol": 25000000.00,
+            "cum_vol_delta": 2663583.1075,
+        },
+    ],
+}
+
+MOCK_STABLECOIN_OI_RESPONSE = {
+    "code": "0",
+    "data": [
+        {
+            "time": 1704067200000,
+            "open": 193833.93,
+            "high": 193894.47,
+            "low": 193775.12,
+            "close": 193876.37,
+        },
+        {
+            "time": 1704068100000,
+            "open": 193876.37,
+            "high": 194000.00,
+            "low": 193800.00,
+            "close": 193950.00,
+        },
+    ],
+}
+
 
 class _MockHandler(BaseHTTPRequestHandler):
     """Serve mock Coinglass API responses."""
@@ -126,6 +243,12 @@ class _MockHandler(BaseHTTPRequestHandler):
             "/api/futures/top-long-short-position-ratio/history": MOCK_TOP_LS_RESPONSE,
             "/api/futures/aggregated-cvd/history": MOCK_CVD_RESPONSE,
             "/api/futures/basis/history": MOCK_BASIS_RESPONSE,
+            "/api/futures/open-interest/history": MOCK_PAIR_OI_RESPONSE,
+            "/api/futures/funding-rate/history": MOCK_PAIR_FUNDING_RESPONSE,
+            "/api/futures/liquidation/history": MOCK_PAIR_LIQUIDATION_RESPONSE,
+            "/api/futures/v2/taker-buy-sell-volume/history": MOCK_PAIR_TAKER_VOLUME_RESPONSE,
+            "/api/futures/cvd/history": MOCK_PAIR_CVD_RESPONSE,
+            "/api/futures/open-interest/aggregated-stablecoin-history": MOCK_STABLECOIN_OI_RESPONSE,
         }
         body = responses.get(path, {"code": "0", "data": []})
         self.send_response(200)
@@ -188,3 +311,81 @@ def test_fetch_basis_history(client: CoinglassClient) -> None:
     assert bars[0].open_basis == 0.0512
     assert bars[0].close_basis == 0.0495
     assert bars[1].close_basis == 0.0530
+
+
+# ── Strategy C: pair-level (BTCUSDT) endpoints ────────────────────────
+
+
+def test_fetch_pair_oi_history(client: CoinglassClient) -> None:
+    """Pair-level OI history (per-exchange BTCUSDT)."""
+    bars = client.fetch_pair_oi_history(
+        exchange="Binance", symbol="BTCUSDT", interval="15m",
+    )
+    assert len(bars) == 2
+    assert isinstance(bars[0], OIBar)
+    assert bars[0].close == 6724383023.0
+    assert bars[1].close == 6722441838.35
+    assert bars[0].timestamp == datetime(2024, 1, 1, 0, 0)
+
+
+def test_fetch_pair_funding_rate_history(client: CoinglassClient) -> None:
+    """Pair-level funding rate history (per-exchange BTCUSDT)."""
+    bars = client.fetch_pair_funding_rate_history(
+        exchange="Binance", symbol="BTCUSDT", interval="15m",
+    )
+    assert len(bars) == 2
+    assert isinstance(bars[0], FundingRateBar)
+    assert bars[0].close == 0.002933
+    assert bars[1].close == 0.003050
+
+
+def test_fetch_pair_liquidation_history(client: CoinglassClient) -> None:
+    """Pair-level liquidation history (per-exchange BTCUSDT)."""
+    bars = client.fetch_pair_liquidation_history(
+        exchange="Binance", symbol="BTCUSDT", interval="15m",
+    )
+    assert len(bars) == 2
+    assert isinstance(bars[0], LiquidationBar)
+    assert bars[0].long_usd == 12345.67
+    assert bars[0].short_usd == 98765.43
+    assert bars[1].long_usd == 0.0
+    assert bars[1].short_usd == 5000.00
+
+
+def test_fetch_pair_taker_volume_history(client: CoinglassClient) -> None:
+    """Pair-level taker buy/sell volume history (v2 endpoint, per-exchange BTCUSDT)."""
+    bars = client.fetch_pair_taker_volume_history(
+        exchange="Binance", symbol="BTCUSDT", interval="15m",
+    )
+    assert len(bars) == 2
+    assert isinstance(bars[0], TakerVolumeBar)
+    assert bars[0].buy_usd == 27145645.4238
+    assert bars[0].sell_usd == 29482062.3163
+    assert bars[1].buy_usd == 30000000.00
+
+
+def test_fetch_pair_cvd_history(client: CoinglassClient) -> None:
+    """Pair-level CVD history (per-exchange BTCUSDT, no 'agg_' prefix)."""
+    bars = client.fetch_pair_cvd_history(
+        exchange="Binance", symbol="BTCUSDT", interval="15m",
+    )
+    assert len(bars) == 2
+    assert isinstance(bars[0], CVDBar)
+    assert bars[0].buy_vol == 27145645.4238
+    assert bars[0].sell_vol == 29482062.3163
+    assert bars[0].cvd == -2336416.8925
+    assert bars[1].cvd == 2663583.1075
+
+
+def test_fetch_stablecoin_oi_history(client: CoinglassClient) -> None:
+    """Aggregated stablecoin-margined OI history (cross-exchange, BTC coin-level)."""
+    bars = client.fetch_stablecoin_oi_history(
+        symbol="BTC",
+        exchange_list="Binance,OKX,Bybit",
+        interval="15m",
+    )
+    assert len(bars) == 2
+    assert isinstance(bars[0], OIBar)
+    assert bars[0].close == 193876.37
+    assert bars[1].close == 193950.00
+    assert bars[0].timestamp == datetime(2024, 1, 1, 0, 0)

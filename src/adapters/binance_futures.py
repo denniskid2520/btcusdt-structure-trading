@@ -1,12 +1,14 @@
 """Binance USDT-M Futures data adapter — public API, no auth required.
 
 Fetches real OHLCV klines from Binance Futures API (fapi) with
-automatic pagination for large date ranges.
+automatic pagination for large date ranges. Also fetches historical
+funding rates via /fapi/v1/fundingRate.
 """
 from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
@@ -15,8 +17,27 @@ from urllib.request import Request, urlopen
 from adapters.base import MarketBar, MarketDataAdapter
 
 
+@dataclass(frozen=True)
+class FundingRateRecord:
+    """One settled funding-rate observation on Binance USDT-M perp.
+
+    Funding settles every 8 hours on BTCUSDT. `timestamp` is the settlement
+    instant in naive UTC (same convention as MarketBar). `funding_rate` is
+    the raw fraction — e.g. 0.0001 = 0.01% = 1bp per 8h.
+
+    `mark_price` is the mark price at settlement. It is Optional because
+    Binance's /fapi/v1/fundingRate returns an empty string for some early
+    USDT-M records (2019-2020). Callers that need mark price should check
+    for None and drop or forward-fill as appropriate.
+    """
+    timestamp: datetime
+    funding_rate: float
+    mark_price: float | None
+
+
 _BASE_URL = "https://fapi.binance.com"
 _MAX_PER_REQUEST = 1500  # Futures API allows up to 1500
+_FUNDING_MAX_PER_REQUEST = 1000  # /fapi/v1/fundingRate caps at 1000
 
 _TIMEFRAME_MS = {
     "1m": 60_000,
@@ -119,6 +140,101 @@ class BinanceFuturesAdapter(MarketDataAdapter):
         with urlopen(request, timeout=10) as response:
             data = json.loads(response.read().decode("utf-8"))
         return float(data["markPrice"])
+
+    def fetch_funding_rate_history(
+        self,
+        symbol: str,
+        *,
+        start: datetime,
+        end: datetime,
+    ) -> list[FundingRateRecord]:
+        """Fetch settled funding rates for `symbol` in [start, end].
+
+        Uses /fapi/v1/fundingRate. Binance caps this endpoint at `limit=1000`
+        per request, so we paginate by advancing the startTime cursor past
+        the last fundingTime of the previous page + 1ms (strictly greater
+        than last fundingTime, to avoid duplicates).
+
+        Funding settles every 8h on BTCUSDT → 3 records/day → a 5-year range
+        is ~5,475 records → ~6 paginated calls.
+
+        Args:
+            symbol: e.g. "BTCUSDT".
+            start: inclusive range start (naive UTC).
+            end: inclusive range end (naive UTC).
+
+        Returns:
+            List of FundingRateRecord, strictly ascending by timestamp.
+        """
+        start_ms = int(start.replace(tzinfo=timezone.utc).timestamp() * 1000)
+        end_ms = int(end.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+        records: list[FundingRateRecord] = []
+        cursor = start_ms
+
+        while cursor <= end_ms:
+            page = self._get_funding_rate(
+                symbol=symbol,
+                start_time=cursor,
+                end_time=end_ms,
+                limit=_FUNDING_MAX_PER_REQUEST,
+            )
+            if not page:
+                break
+
+            for row in page:
+                records.append(self._parse_funding(row))
+
+            last_ft_ms = int(page[-1]["fundingTime"])
+            # Advance strictly past the last fundingTime so we don't refetch it.
+            cursor = last_ft_ms + 1
+
+            if len(page) < _FUNDING_MAX_PER_REQUEST:
+                break
+            time.sleep(0.2)
+
+        return records
+
+    def _get_funding_rate(
+        self,
+        symbol: str,
+        start_time: int,
+        end_time: int,
+        limit: int,
+    ) -> list[dict]:
+        params: dict[str, str | int] = {
+            "symbol": symbol,
+            "startTime": start_time,
+            "endTime": end_time,
+            "limit": limit,
+        }
+        query = urlencode(params)
+        url = f"{self.base_url}/fapi/v1/fundingRate?{query}"
+        request = Request(url=url, method="GET")
+        request.add_header("Accept", "application/json")
+
+        try:
+            with urlopen(request, timeout=15) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Binance Futures HTTP {error.code}: {detail}") from error
+        except URLError as error:
+            raise RuntimeError(f"Binance Futures request failed: {error.reason}") from error
+
+    @staticmethod
+    def _parse_funding(row: dict) -> FundingRateRecord:
+        mark_raw = row.get("markPrice", "")
+        mark_price: float | None
+        if mark_raw == "" or mark_raw is None:
+            mark_price = None
+        else:
+            mark_price = float(mark_raw)
+        return FundingRateRecord(
+            timestamp=datetime.fromtimestamp(int(row["fundingTime"]) / 1000, tz=timezone.utc).replace(tzinfo=None),
+            funding_rate=float(row["fundingRate"]),
+            mark_price=mark_price,
+        )
 
     def _get_klines(
         self,

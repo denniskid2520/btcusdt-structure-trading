@@ -26,6 +26,7 @@ import os
 import sys
 import time
 import traceback
+import uuid
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -490,8 +491,39 @@ class LiveService:
 
         # Submit entry order BEFORE marking position open.
         # Internal OPEN state must only be set after exchange confirms FILLED.
-        self._log_tick("Placing MARKET BUY...")
-        entry_evt = self._place_market_order("BUY", quantity)
+        # Use newClientOrderId for idempotent retry: if the request times
+        # out, we can query by this ID to resolve "placed or not".
+        client_oid = f"entry_{uuid.uuid4().hex[:16]}"
+        self._log_tick(f"Placing MARKET BUY (clientOrderId={client_oid})...")
+        entry_evt = self._place_market_order("BUY", quantity, client_order_id=client_oid)
+
+        # If entry_evt is None (timeout/exception), query by clientOrderId
+        # to check if the order actually went through before giving up.
+        if entry_evt is None:
+            self._log_tick("Entry returned None — querying by clientOrderId...")
+            entry_evt = self._query_order_by_client_id(client_oid)
+            if entry_evt is not None:
+                self._log_tick(
+                    f"Order found via query: status={entry_evt.get('status')}")
+            else:
+                # Also check if position appeared on exchange
+                try:
+                    pos = fetch_position(self.api_key, self.api_secret)
+                    pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
+                    if abs(pos_amt) > 0.0001:
+                        emit_alert(CANDIDATE_ID, "CRITICAL",
+                                   f"Entry order unknown but exchange has "
+                                   f"position {pos_amt} — HALTING")
+                        self.halted = True
+                        self.halt_reason = (
+                            f"entry_unknown_but_position_exists: {pos_amt}")
+                        self.has_live_position = True
+                        self.live_quantity = abs(pos_amt)
+                        self.live_entry_price = price
+                        self._save_runner()
+                        return
+                except Exception:
+                    pass
 
         # CODEX FIX 1: require explicit FILLED status, not just "not REJECTED".
         # A NEW or PARTIALLY_FILLED response means the order isn't done yet —
@@ -626,20 +658,31 @@ class LiveService:
         self.live_alpha_level = alpha_level
         self.live_catastrophe_level = cat_level
 
-    def _place_market_order(self, side: str, quantity: float) -> dict | None:
+    def _place_market_order(
+        self, side: str, quantity: float,
+        client_order_id: str | None = None,
+    ) -> dict | None:
         """Place a MARKET order on Binance and return the response.
 
         Uses newOrderRespType=RESULT so the response includes
         status=FILLED, executedQty, and avgPrice for MARKET orders.
         Without this, Binance may return status=NEW with no fill data.
+
+        If client_order_id is provided, it's sent as newClientOrderId
+        for idempotent retry: on timeout, we can query by this ID to
+        check if the order actually went through.
         """
         from execution.live_executor import _signed_request
+        params: dict = {
+            "symbol": "BTCUSDT", "side": side, "type": "MARKET",
+            "quantity": f"{quantity:.3f}",
+            "newOrderRespType": "RESULT",
+        }
+        if client_order_id:
+            params["newClientOrderId"] = client_order_id
         try:
             return _signed_request(
-                "POST", "/fapi/v1/order",
-                {"symbol": "BTCUSDT", "side": side, "type": "MARKET",
-                 "quantity": f"{quantity:.3f}",
-                 "newOrderRespType": "RESULT"},
+                "POST", "/fapi/v1/order", params,
                 self.api_key, self.api_secret,
             )
         except Exception as e:
@@ -653,6 +696,11 @@ class LiveService:
         If the position was already closed (e.g., by catastrophe stop),
         Binance will EXPIRE or REJECT the reduceOnly order instead of
         opening a new opposite position.
+
+        Binance error -2022 ('ReduceOnly Order is rejected') comes as an
+        API exception, not as order status=REJECTED. We detect this and
+        return a synthetic REJECTED response so the caller can handle it
+        the same way (verify exchange, clear if flat, else HALT).
         """
         from execution.live_executor import _signed_request
         try:
@@ -664,8 +712,37 @@ class LiveService:
                 self.api_key, self.api_secret,
             )
         except Exception as e:
+            err_str = str(e)
+            # Binance -2022: 'ReduceOnly Order is rejected' — position
+            # was already closed. Return synthetic REJECTED so caller
+            # can verify exchange and clear if flat (avoids unnecessary HALT).
+            if "-2022" in err_str:
+                emit_alert(CANDIDATE_ID, "WARN",
+                           f"reduceOnly {side} got -2022 (no position to reduce): {e}")
+                return {"status": "REJECTED", "code": -2022,
+                        "msg": "ReduceOnly Order is rejected"}
             emit_alert(CANDIDATE_ID, "CRITICAL",
                        f"MARKET {side} (reduceOnly) failed: {e}")
+            self._last_reduce_only_error = err_str
+            return None
+
+    def _query_order_by_client_id(self, client_order_id: str) -> dict | None:
+        """Query an order by newClientOrderId to resolve 'placed or not'.
+
+        Used for idempotent retry: when _place_market_order returns None
+        (timeout), we query to check if the order actually went through.
+        Returns the order dict if found, None if not found or error.
+        """
+        from execution.live_executor import _signed_request
+        try:
+            return _signed_request(
+                "GET", "/fapi/v1/order",
+                {"symbol": "BTCUSDT",
+                 "origClientOrderId": client_order_id},
+                self.api_key, self.api_secret,
+            )
+        except Exception as e:
+            self._log_tick(f"Query by clientOrderId failed: {e}")
             return None
 
     def _handle_exit(self, bar: MarketBar, reason: str) -> None:
@@ -709,21 +786,39 @@ class LiveService:
                            f"{cancel_result.get('error')}")
 
             # Verify exchange position is zero after exit.
-            try:
-                pos = fetch_position(self.api_key, self.api_secret)
-                pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
-                if abs(pos_amt) > 0.0001:
-                    emit_alert(CANDIDATE_ID, "CRITICAL",
-                               f"Exit FILLED but position still {pos_amt} — "
-                               f"HALTING for manual review")
-                    self.halted = True
-                    self.halt_reason = f"exit_residual_position: {pos_amt}"
-                    self.live_quantity = abs(pos_amt)
-                    self._save_runner()
-                    return
-            except Exception as e:
-                emit_alert(CANDIDATE_ID, "WARN",
-                           f"Post-exit position verify failed: {e}")
+            # Retry with bounded backoff — a single timeout should not
+            # cause us to assume flat when exposure could be real.
+            verify_ok = False
+            for attempt in range(3):
+                try:
+                    pos = fetch_position(self.api_key, self.api_secret)
+                    pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
+                    if abs(pos_amt) > 0.0001:
+                        emit_alert(CANDIDATE_ID, "CRITICAL",
+                                   f"Exit FILLED but position still {pos_amt} — "
+                                   f"HALTING for manual review")
+                        self.halted = True
+                        self.halt_reason = f"exit_residual_position: {pos_amt}"
+                        self.live_quantity = abs(pos_amt)
+                        self._save_runner()
+                        return
+                    verify_ok = True
+                    break
+                except Exception as e:
+                    emit_alert(CANDIDATE_ID, "WARN",
+                               f"Post-exit position verify attempt "
+                               f"{attempt + 1}/3 failed: {e}")
+                    if attempt < 2:
+                        time.sleep(1 + attempt)  # 1s, 2s backoff
+            if not verify_ok:
+                # All retries failed — can't confirm flat, HALT
+                emit_alert(CANDIDATE_ID, "CRITICAL",
+                           "Post-exit position verify failed after 3 retries "
+                           "— HALTING, position state unknown")
+                self.halted = True
+                self.halt_reason = "exit_verify_failed: fetch_position 3x timeout"
+                self._save_runner()
+                return
 
             self.has_live_position = False
             self.live_entry_price = 0.0
@@ -742,8 +837,12 @@ class LiveService:
                 pos_amt = float(pos.get("positionAmt", 0)) if pos else 0
                 if abs(pos_amt) < 0.0001:
                     self._log_tick("Confirmed flat after EXPIRED/REJECTED SELL")
-                    # Cancel orphaned stop orders if any
-                    cancel_all_orders(self.api_key, self.api_secret)
+                    # Cancel orphaned stop orders if any — check result
+                    cr = cancel_all_orders(self.api_key, self.api_secret)
+                    if not cr.get("ok"):
+                        emit_alert(CANDIDATE_ID, "WARN",
+                                   f"Orphan stop cancel failed after "
+                                   f"EXPIRED/REJECTED flat: {cr.get('error')}")
                     self.has_live_position = False
                     self.live_entry_price = 0.0
                     self.live_quantity = 0.0

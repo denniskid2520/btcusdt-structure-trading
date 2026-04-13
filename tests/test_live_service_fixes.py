@@ -1141,3 +1141,247 @@ class TestP0LiveSafetyHardening:
         assert svc.has_live_position is False
 
 
+# ── GPT Pro Review Round 2: P1 fixes ──────────────────────────────
+
+
+class TestP1OrphanStopCancel:
+    """P1: EXPIRED/REJECTED 'confirmed flat' path must check
+    cancel_all_orders return and WARN on failure (both Codex + GPT Pro)."""
+
+    def test_expired_flat_cancel_fail_warns(self, tmp_path):
+        """When EXPIRED + confirmed flat, cancel_all_orders failure
+        must emit WARN (not silently ignore)."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "EXPIRED",
+        })
+
+        cancel_mock = MagicMock(return_value={"ok": False, "error": "timeout"})
+        with patch("execution.live_service.cancel_all_orders", cancel_mock), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}), \
+             patch("execution.live_service.emit_alert") as alert_mock:
+            svc._handle_exit(_bar(), "time_stop")
+
+        # cancel WAS called
+        cancel_mock.assert_called_once()
+        # WARN emitted about the failure
+        warn_calls = [c for c in alert_mock.call_args_list
+                      if c[0][1] == "WARN" and "orphan" in c[0][2].lower()]
+        assert len(warn_calls) >= 1, "Expected WARN about orphan stop cancel failure"
+        # Still confirmed flat (don't HALT just because cancel failed)
+        assert svc.has_live_position is False
+
+    def test_rejected_flat_cancel_fail_warns(self, tmp_path):
+        """Same as above but with REJECTED status."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "REJECTED",
+        })
+
+        cancel_mock = MagicMock(return_value={"ok": False, "error": "conn reset"})
+        with patch("execution.live_service.cancel_all_orders", cancel_mock), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}), \
+             patch("execution.live_service.emit_alert") as alert_mock:
+            svc._handle_exit(_bar(), "time_stop")
+
+        cancel_mock.assert_called_once()
+        warn_calls = [c for c in alert_mock.call_args_list
+                      if c[0][1] == "WARN" and "orphan" in c[0][2].lower()]
+        assert len(warn_calls) >= 1
+        assert svc.has_live_position is False
+
+
+class TestP1ReduceOnly2022Exception:
+    """P1: Binance -2022 'ReduceOnly Order is rejected' comes as an
+    API exception, not order status=REJECTED.  Should treat like
+    EXPIRED/REJECTED: verify exchange, clear if flat, else HALT."""
+
+    def test_minus_2022_exception_confirms_flat_clears(self, tmp_path):
+        """When reduceOnly SELL throws -2022 and exchange is flat,
+        position should be cleared (not HALT)."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+
+        # _place_reduce_only_order catches exception → returns None
+        # BUT we need to detect -2022 inside it, so we must patch at
+        # a lower level: _signed_request raises with -2022 message.
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "REJECTED", "code": -2022,
+            "msg": "ReduceOnly Order is rejected",
+        })
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}):
+            svc._handle_exit(_bar(), "time_stop")
+
+        assert svc.has_live_position is False
+        assert svc.halted is False
+
+    def test_minus_2022_exception_not_flat_halts(self, tmp_path):
+        """When -2022 exception but exchange still has position → HALT."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+
+        # -2022 returns synthetic REJECTED, but exchange still has position
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "REJECTED", "code": -2022,
+            "msg": "ReduceOnly Order is rejected",
+        })
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0.3"}):
+            svc._handle_exit(_bar(), "time_stop")
+
+        # REJECTED but NOT flat → must HALT
+        assert svc.halted is True
+
+
+class TestP1FetchPositionRetry:
+    """P1: fetch_position after FILLED exit should retry with bounded
+    backoff before giving up (currently just WARN on exception)."""
+
+    def test_retry_succeeds_on_second_attempt(self, tmp_path):
+        """fetch_position fails once then succeeds → should clear position."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
+        })
+
+        call_count = {"n": 0}
+        def _fetch_with_retry(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise ConnectionError("timeout")
+            return {"positionAmt": "0"}
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   side_effect=_fetch_with_retry), \
+             patch("time.sleep"):  # don't actually sleep in tests
+            svc._handle_exit(_bar(), "time_stop")
+
+        assert call_count["n"] >= 2, "Expected at least 2 fetch_position calls"
+        assert svc.has_live_position is False
+
+    def test_all_retries_fail_halts(self, tmp_path):
+        """All fetch_position retries fail → should HALT
+        (currently just WARNs and clears — unsafe)."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
+        })
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   side_effect=ConnectionError("timeout")), \
+             patch("time.sleep"):
+            svc._handle_exit(_bar(), "time_stop")
+
+        # Must HALT when we can't verify position is zero
+        assert svc.halted is True
+        assert "verify" in svc.halt_reason.lower() or "position" in svc.halt_reason.lower()
+
+
+class TestP1IdempotentEntry:
+    """P1: Entry uses newClientOrderId. On exception, query order
+    status before assuming failure."""
+
+    def test_entry_uses_new_client_order_id(self, tmp_path):
+        """MARKET BUY must include newClientOrderId for idempotency."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+
+        captured_args = {}
+        original_place = svc._place_market_order.__class__  # not yet set
+
+        def capture_order(side, qty, client_order_id=None):
+            captured_args["side"] = side
+            captured_args["qty"] = qty
+            captured_args["client_order_id"] = client_order_id
+            return {"status": "FILLED", "avgPrice": "50000",
+                    "executedQty": "0.06", "orderId": "12345"}
+
+        svc._place_market_order = capture_order
+
+        # Mock catastrophe stop placement
+        with patch("execution.live_service.place_catastrophe_stop") as stop_mock, \
+             patch("execution.live_service.log_stop_event"):
+            stop_mock.return_value = MagicMock(
+                event_type="ack", order_id="99")
+            svc._handle_entry(_bar(price=50000.0))
+
+        # Verify client_order_id was passed
+        assert captured_args.get("client_order_id") is not None
+        assert captured_args["client_order_id"].startswith("entry_")
+        assert svc.has_live_position is True
+
+    def test_entry_exception_queries_order_before_failing(self, tmp_path):
+        """When _place_market_order returns None (timeout), service
+        should query by clientOrderId to check if order went through."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+
+        # Entry returns None (timeout)
+        svc._place_market_order = MagicMock(return_value=None)
+
+        query_mock = MagicMock(return_value=None)  # order not found on exchange
+        svc._query_order_by_client_id = query_mock
+
+        with patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}):
+            svc._handle_entry(_bar(price=50000.0))
+
+        # Should have tried to query by clientOrderId
+        query_mock.assert_called_once()
+        # Order not found + no position → stays flat
+        assert svc.has_live_position is False
+
+

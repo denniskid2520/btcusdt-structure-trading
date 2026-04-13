@@ -15,7 +15,9 @@
       "Bash(\"C:/Program Files/GitHub CLI/gh.exe\" auth status)",
       "Read(//c/Users/User/Documents/New project/**)",
       "Bash(\"C:/Program Files/GitHub CLI/gh.exe\" repo create btcusdt-structure-trading --private --source=. --push)",
-      "Bash(\"C:/Program Files/GitHub:*)"
+      "Bash(\"C:/Program Files/GitHub:*)",
+      "Bash(git -C \"C:/Users/User/Documents/New project\" add src/strategies/trend_breakout.py src/research/backtest.py src/research/narrative_case_mapping.py src/research/context_aware_validation.py tests/test_strategy.py tests/test_backtest.py tests/test_narrative_case_mapping.py tests/test_context_aware_validation.py data/reports/)",
+      "Bash(git -C \"C:/Users/User/Documents/New project\" diff --cached --stat)"
     ]
   }
 }

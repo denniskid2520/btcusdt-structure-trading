@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -1139,5 +1140,410 @@ class TestP0LiveSafetyHardening:
 
         # REJECTED + exchange flat → confirmed flat
         assert svc.has_live_position is False
+
+
+# ── GPT Pro Review Round 2: P1 fixes ──────────────────────────────
+
+
+class TestP1OrphanStopCancel:
+    """P1: EXPIRED/REJECTED 'confirmed flat' path must check
+    cancel_all_orders return and WARN on failure (both Codex + GPT Pro)."""
+
+    def test_expired_flat_cancel_fail_warns(self, tmp_path):
+        """When EXPIRED + confirmed flat, cancel_all_orders failure
+        must emit WARN (not silently ignore)."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "EXPIRED",
+        })
+
+        cancel_mock = MagicMock(return_value={"ok": False, "error": "timeout"})
+        with patch("execution.live_service.cancel_all_orders", cancel_mock), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}), \
+             patch("execution.live_service.emit_alert") as alert_mock:
+            svc._handle_exit(_bar(), "time_stop")
+
+        # cancel WAS called
+        cancel_mock.assert_called_once()
+        # WARN emitted about the failure
+        warn_calls = [c for c in alert_mock.call_args_list
+                      if c[0][1] == "WARN" and "orphan" in c[0][2].lower()]
+        assert len(warn_calls) >= 1, "Expected WARN about orphan stop cancel failure"
+        # Still confirmed flat (don't HALT just because cancel failed)
+        assert svc.has_live_position is False
+
+    def test_rejected_flat_cancel_fail_warns(self, tmp_path):
+        """Same as above but with REJECTED status."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "REJECTED",
+        })
+
+        cancel_mock = MagicMock(return_value={"ok": False, "error": "conn reset"})
+        with patch("execution.live_service.cancel_all_orders", cancel_mock), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}), \
+             patch("execution.live_service.emit_alert") as alert_mock:
+            svc._handle_exit(_bar(), "time_stop")
+
+        cancel_mock.assert_called_once()
+        warn_calls = [c for c in alert_mock.call_args_list
+                      if c[0][1] == "WARN" and "orphan" in c[0][2].lower()]
+        assert len(warn_calls) >= 1
+        assert svc.has_live_position is False
+
+
+class TestP1ReduceOnly2022Exception:
+    """P1: Binance -2022 'ReduceOnly Order is rejected' comes as an
+    API exception, not order status=REJECTED.  Should treat like
+    EXPIRED/REJECTED: verify exchange, clear if flat, else HALT."""
+
+    def test_minus_2022_exception_confirms_flat_clears(self, tmp_path):
+        """When reduceOnly SELL throws -2022 and exchange is flat,
+        position should be cleared (not HALT)."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+
+        # _place_reduce_only_order catches exception → returns None
+        # BUT we need to detect -2022 inside it, so we must patch at
+        # a lower level: _signed_request raises with -2022 message.
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "REJECTED", "code": -2022,
+            "msg": "ReduceOnly Order is rejected",
+        })
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}):
+            svc._handle_exit(_bar(), "time_stop")
+
+        assert svc.has_live_position is False
+        assert svc.halted is False
+
+    def test_minus_2022_exception_not_flat_halts(self, tmp_path):
+        """When -2022 exception but exchange still has position → HALT."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+
+        # -2022 returns synthetic REJECTED, but exchange still has position
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "REJECTED", "code": -2022,
+            "msg": "ReduceOnly Order is rejected",
+        })
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0.3"}):
+            svc._handle_exit(_bar(), "time_stop")
+
+        # REJECTED but NOT flat → must HALT
+        assert svc.halted is True
+
+
+class TestP1FetchPositionRetry:
+    """P1: fetch_position after FILLED exit should retry with bounded
+    backoff before giving up (currently just WARN on exception)."""
+
+    def test_retry_succeeds_on_second_attempt(self, tmp_path):
+        """fetch_position fails once then succeeds → should clear position."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
+        })
+
+        call_count = {"n": 0}
+        def _fetch_with_retry(*args, **kwargs):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise ConnectionError("timeout")
+            return {"positionAmt": "0"}
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   side_effect=_fetch_with_retry), \
+             patch("time.sleep"):  # don't actually sleep in tests
+            svc._handle_exit(_bar(), "time_stop")
+
+        assert call_count["n"] >= 2, "Expected at least 2 fetch_position calls"
+        assert svc.has_live_position is False
+
+    def test_all_retries_fail_halts(self, tmp_path):
+        """All fetch_position retries fail → should HALT
+        (currently just WARNs and clears — unsafe)."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc.has_live_position = True
+        svc.live_quantity = 0.3
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "open"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 2
+        svc.runner.state.next_zone_id = 2
+        svc.runner.state.bars_since_last_exit = 5
+        svc.runner.trades = []
+        svc._place_reduce_only_order = MagicMock(return_value={
+            "status": "FILLED", "avgPrice": "50000", "executedQty": "0.3",
+        })
+
+        with patch("execution.live_service.cancel_all_orders",
+                    return_value={"ok": True}), \
+             patch("execution.live_service.fetch_position",
+                   side_effect=ConnectionError("timeout")), \
+             patch("time.sleep"):
+            svc._handle_exit(_bar(), "time_stop")
+
+        # Must HALT when we can't verify position is zero
+        assert svc.halted is True
+        assert "verify" in svc.halt_reason.lower() or "position" in svc.halt_reason.lower()
+
+
+class TestP1IdempotentEntry:
+    """P1: Entry uses newClientOrderId. On exception, query order
+    status before assuming failure."""
+
+    def test_entry_uses_new_client_order_id(self, tmp_path):
+        """MARKET BUY must include newClientOrderId for idempotency."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+
+        captured_args = {}
+        original_place = svc._place_market_order.__class__  # not yet set
+
+        def capture_order(side, qty, client_order_id=None):
+            captured_args["side"] = side
+            captured_args["qty"] = qty
+            captured_args["client_order_id"] = client_order_id
+            return {"status": "FILLED", "avgPrice": "50000",
+                    "executedQty": "0.06", "orderId": "12345"}
+
+        svc._place_market_order = capture_order
+
+        # Mock catastrophe stop placement
+        with patch("execution.live_service.place_catastrophe_stop") as stop_mock, \
+             patch("execution.live_service.log_stop_event"):
+            stop_mock.return_value = MagicMock(
+                event_type="ack", order_id="99")
+            svc._handle_entry(_bar(price=50000.0))
+
+        # Verify client_order_id was passed
+        assert captured_args.get("client_order_id") is not None
+        assert captured_args["client_order_id"].startswith("entry_")
+        assert svc.has_live_position is True
+
+    def test_entry_exception_queries_order_before_failing(self, tmp_path):
+        """When _place_market_order returns None (timeout), service
+        should query by clientOrderId to check if order went through."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+
+        # Entry returns None (timeout)
+        svc._place_market_order = MagicMock(return_value=None)
+
+        query_mock = MagicMock(return_value=None)  # order not found on exchange
+        svc._query_order_by_client_id = query_mock
+
+        with patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0"}):
+            svc._handle_entry(_bar(price=50000.0))
+
+        # Should have tried to query by clientOrderId
+        query_mock.assert_called_once()
+        # Order not found + no position → stays flat
+        assert svc.has_live_position is False
+
+
+class TestP1PersistStopLevelsOnUnknownEntry:
+    """Codex P1: when entry timeout + exchange shows position,
+    must persist stop levels so _reconcile() can re-place catastrophe."""
+
+    def test_unknown_entry_with_position_persists_stop_levels(self, tmp_path):
+        """Entry timeout → query fails → exchange has position →
+        HALT with alpha_level and catastrophe_level set."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+
+        # Entry times out → None
+        svc._place_market_order = MagicMock(return_value=None)
+        # Query by clientOrderId also fails
+        svc._query_order_by_client_id = MagicMock(return_value=None)
+
+        # But exchange shows a position with entryPrice
+        with patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0.06",
+                                 "entryPrice": "50500.0"}):
+            svc._handle_entry(_bar(price=50000.0))
+
+        # Must HALT
+        assert svc.halted is True
+        assert svc.has_live_position is True
+        assert svc.live_quantity == 0.06
+        # CRITICAL: stop levels must be set so _reconcile() can re-place
+        assert svc.live_entry_price == 50500.0  # prefer exchange entryPrice
+        assert svc.live_alpha_level > 0
+        assert svc.live_catastrophe_level > 0
+        # Check levels are derived from entryPrice
+        expected_alpha = 50500.0 * (1 - svc.candidate_cfg.alpha_stop_pct)
+        expected_cat = 50500.0 * (1 - svc.candidate_cfg.catastrophe_stop_pct)
+        assert abs(svc.live_alpha_level - expected_alpha) < 0.01
+        assert abs(svc.live_catastrophe_level - expected_cat) < 0.01
+
+    def test_unknown_entry_uses_exchange_entry_price_over_bar(self, tmp_path):
+        """Should prefer exchange's entryPrice over bar.open for
+        stop level calculation (more accurate fill price)."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+
+        svc._place_market_order = MagicMock(return_value=None)
+        svc._query_order_by_client_id = MagicMock(return_value=None)
+
+        # Exchange has position at 51000 (different from bar.open=50000)
+        with patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0.06",
+                                 "entryPrice": "51000.0"}):
+            svc._handle_entry(_bar(price=50000.0))
+
+        # Should use exchange entryPrice (51000), not bar.open (50000)
+        assert svc.live_entry_price == 51000.0
+        expected_cat = 51000.0 * (1 - svc.candidate_cfg.catastrophe_stop_pct)
+        assert abs(svc.live_catastrophe_level - expected_cat) < 0.01
+
+    def test_unknown_entry_no_entry_price_falls_back_to_bar(self, tmp_path):
+        """If exchange doesn't provide entryPrice, fall back to bar.open."""
+        svc = _make_service(tmp_path, dry_run=False)
+        svc._get_strategy_equity = MagicMock(return_value=10000.0)
+        svc._log_tick = MagicMock()
+        svc._log_event = MagicMock()
+        svc.runner._rsi_buffer = [100.0] * 20
+        svc.runner.state.position_state = "flat"
+        svc.runner.state.regime_active = True
+        svc.runner.state.next_trade_id = 1
+        svc.runner.state.next_zone_id = 1
+        svc.runner.state.bars_since_last_exit = 999
+        svc.runner.trades = []
+
+        svc._place_market_order = MagicMock(return_value=None)
+        svc._query_order_by_client_id = MagicMock(return_value=None)
+
+        # Exchange has position but no entryPrice field
+        with patch("execution.live_service.fetch_position",
+                   return_value={"positionAmt": "0.06"}):
+            svc._handle_entry(_bar(price=50000.0))
+
+        assert svc.live_entry_price == 50000.0  # fallback to bar.open
+        expected_cat = 50000.0 * (1 - svc.candidate_cfg.catastrophe_stop_pct)
+        assert abs(svc.live_catastrophe_level - expected_cat) < 0.01
+
+
+class TestP1RecvWindow:
+    """P1: _signed_request must include recvWindow and use
+    server-time offset to prevent timestamp-related rejects."""
+
+    def test_signed_request_includes_recv_window(self, tmp_path):
+        """recvWindow must be present in signed request params."""
+        from execution.live_executor import _signed_request
+        import urllib.request
+
+        captured_url = {}
+        def mock_urlopen(req, timeout=10):
+            captured_url["url"] = req.full_url
+            # Return a mock response
+            resp = MagicMock()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            resp.read = MagicMock(return_value=b'{"ok": true}')
+            return resp
+
+        with patch.object(urllib.request, "urlopen", mock_urlopen):
+            _signed_request("GET", "/fapi/v1/test", {},
+                            "testkey", "testsecret")
+
+        assert "recvWindow" in captured_url["url"]
+
+    def test_signed_request_uses_server_time_offset(self, tmp_path):
+        """timestamp should incorporate server-time offset when available."""
+        from execution import live_executor
+        import urllib.request
+
+        # Set a known offset (server is 500ms ahead of local)
+        original_offset = getattr(live_executor, '_server_time_offset_ms', 0)
+        live_executor._server_time_offset_ms = 500
+
+        captured_url = {}
+        def mock_urlopen(req, timeout=10):
+            captured_url["url"] = req.full_url
+            resp = MagicMock()
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            resp.read = MagicMock(return_value=b'{"ok": true}')
+            return resp
+
+        with patch.object(urllib.request, "urlopen", mock_urlopen):
+            live_executor._signed_request("GET", "/fapi/v1/test", {},
+                                          "testkey", "testsecret")
+
+        # Restore
+        live_executor._server_time_offset_ms = original_offset
+
+        # timestamp in URL should have the offset applied
+        import urllib.parse
+        parsed = urllib.parse.parse_qs(
+            urllib.parse.urlparse(captured_url["url"]).query)
+        ts = int(parsed["timestamp"][0])
+        # ts should be close to (time.time() * 1000 + 500)
+        now_ms = int(time.time() * 1000)
+        # Allow 2s tolerance for test execution time
+        assert abs(ts - (now_ms + 500)) < 2000
 
 
